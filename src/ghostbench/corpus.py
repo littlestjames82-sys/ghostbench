@@ -48,11 +48,16 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", "dist", ".venv", "venv"}
 
 
 class CorpusError(ValueError):
-    pass
+    """Raised when a corpus file is missing, malformed, or inconsistent.
+
+    The CLI prints this as ``error: ...`` and exits 2.
+    """
 
 
 @dataclass
 class Task:
+    """One bench task inside a project (see the module docstring)."""
+
     id: str
     prompt: str = ""
     expected_files: list = field(default_factory=list)
@@ -68,6 +73,8 @@ class Task:
 
 @dataclass
 class Project:
+    """A recorded project: an id, an absolute path, and its tasks."""
+
     id: str
     path: str  # absolute
     commit: str | None = None
@@ -77,6 +84,8 @@ class Project:
 
 @dataclass
 class Corpus:
+    """A loaded corpus file: metadata plus its projects, in file order."""
+
     name: str
     version: str
     path: str  # corpus file (absolute)
@@ -85,6 +94,7 @@ class Corpus:
     raw: dict = field(default_factory=dict)
 
     def all_tasks(self):
+        """Yield ``(project, task)`` pairs for every task in the corpus."""
         for project in self.projects:
             for task in project.tasks:
                 yield project, task
@@ -120,6 +130,11 @@ def compute_tree_hash(root: str) -> str:
 
 
 def list_project_files(root: str) -> list[str]:
+    """Return sorted project-relative file paths under ``root``.
+
+    Skips the directories in ``SKIP_DIRS`` (for example ``.git`` and
+    ``__pycache__``).
+    """
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
@@ -128,7 +143,28 @@ def list_project_files(root: str) -> list[str]:
     return sorted(out)
 
 
+def _str_list(task_id: str, field_name: str, value) -> list:
+    """expected_files / expected_symbols must be a list of strings.
+    list('a.py') would silently split a bare string into characters
+    and score against nonsense paths, so reject non-lists outright."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value):
+        raise CorpusError(
+            f"task {task_id}: '{field_name}' must be a list of strings")
+    return list(value)
+
+
 def load_corpus(path: str) -> Corpus:
+    """Load and validate a corpus JSON file.
+
+    Resolves project paths relative to the corpus file, stamps a
+    ``tree_hash`` for any project that does not carry one, and raises
+    :class:`CorpusError` for a missing file, invalid JSON, duplicate
+    project or task ids, a missing project directory, or a
+    non-positive ``budget_tokens``.
+    """
     apath = os.path.abspath(path)
     if not os.path.isfile(apath):
         raise CorpusError(f"corpus file not found: {path}")
@@ -155,38 +191,69 @@ def load_corpus(path: str) -> Corpus:
         if not isinstance(praw, dict) or not praw.get("id"):
             raise CorpusError("each project requires an 'id'")
         pid = praw["id"]
+        if not isinstance(pid, str):
+            raise CorpusError("each project 'id' must be a string")
         if pid in seen_projects:
             raise CorpusError(f"duplicate project id: {pid}")
         seen_projects.add(pid)
         ppath_raw = praw.get("path")
-        if not ppath_raw:
+        if not ppath_raw or not isinstance(ppath_raw, str):
             raise CorpusError(f"project {pid}: requires 'path'")
         ppath = _resolve(base, ppath_raw)
         if not os.path.isdir(ppath):
             raise CorpusError(f"project {pid}: path is not a directory: {ppath_raw}")
+        tasks_raw = praw.get("tasks") or []
+        if not isinstance(tasks_raw, list):
+            raise CorpusError(f"project {pid}: 'tasks' must be a list")
         tasks = []
         seen_tasks = set()
-        for traw in praw.get("tasks") or []:
+        for traw in tasks_raw:
             if not isinstance(traw, dict) or not traw.get("id"):
                 raise CorpusError(f"project {pid}: each task requires an 'id'")
             tid = traw["id"]
+            if not isinstance(tid, str):
+                raise CorpusError(f"project {pid}: each task 'id' must be a string")
             if tid in seen_tasks:
                 raise CorpusError(f"project {pid}: duplicate task id: {tid}")
             seen_tasks.add(tid)
             budget = traw.get("budget_tokens")
-            if budget is not None and (not isinstance(budget, int) or budget <= 0):
+            if budget is not None and (not isinstance(budget, int)
+                                       or isinstance(budget, bool)
+                                       or budget <= 0):
                 raise CorpusError(f"task {tid}: budget_tokens must be a positive int")
+            prompt = traw.get("prompt", "")
+            if not isinstance(prompt, str):
+                raise CorpusError(f"task {tid}: 'prompt' must be a string")
+            for opt in ("recorded_patch", "patch_text", "verify_report"):
+                if traw.get(opt) is not None and not isinstance(traw.get(opt), str):
+                    raise CorpusError(f"task {tid}: '{opt}' must be a string")
+            test_command = traw.get("test_command")
+            if test_command is not None and not (
+                    isinstance(test_command, str)
+                    or (isinstance(test_command, list) and all(
+                        isinstance(part, str) for part in test_command))):
+                raise CorpusError(
+                    f"task {tid}: 'test_command' must be a string "
+                    "or a list of strings")
+            variants = traw.get("variants") or {}
+            if not isinstance(variants, dict) or not all(
+                    isinstance(spec, dict) for spec in variants.values()):
+                raise CorpusError(
+                    f"task {tid}: 'variants' must be an object mapping "
+                    "variant names to bundle spec objects")
             tasks.append(Task(
                 id=tid,
-                prompt=traw.get("prompt", ""),
-                expected_files=list(traw.get("expected_files") or []),
-                expected_symbols=list(traw.get("expected_symbols") or []),
+                prompt=prompt,
+                expected_files=_str_list(tid, "expected_files",
+                                         traw.get("expected_files")),
+                expected_symbols=_str_list(tid, "expected_symbols",
+                                           traw.get("expected_symbols")),
                 recorded_patch=traw.get("recorded_patch"),
                 patch_text=traw.get("patch_text"),
-                test_command=traw.get("test_command"),
+                test_command=test_command,
                 budget_tokens=budget,
                 verify_report=traw.get("verify_report"),
-                variants=dict(traw.get("variants") or {}),
+                variants=dict(variants),
                 raw=traw,
             ))
         projects.append(Project(
@@ -200,6 +267,13 @@ def load_corpus(path: str) -> Corpus:
 
 
 def read_task_patch(corpus: Corpus, project: Project, task: Task) -> str | None:
+    """Return a task's recorded patch text, or ``None`` if it has none.
+
+    Inline ``patch_text`` wins; otherwise ``recorded_patch`` is read
+    from disk, resolved relative to the corpus file first and then
+    relative to the project directory. Raises :class:`CorpusError`
+    when a named patch file cannot be found.
+    """
     if task.patch_text:
         return task.patch_text
     if not task.recorded_patch:
@@ -218,6 +292,12 @@ def read_task_patch(corpus: Corpus, project: Project, task: Task) -> str | None:
 
 
 def read_verify_report(corpus: Corpus, project: Project, task: Task):
+    """Return ``(report_dict, sha256_hex)`` for a task's Verify report.
+
+    Returns ``(None, None)`` when the task names no report. The hash
+    is over the canonical (sorted-keys) JSON, for report traceability.
+    Resolution matches :func:`read_task_patch`.
+    """
     if not task.verify_report:
         return None, None
     p = _resolve(corpus.base_dir, task.verify_report)
@@ -228,7 +308,14 @@ def read_verify_report(corpus: Corpus, project: Project, task: Task):
         else:
             raise CorpusError(
                 f"task {task.id}: verify_report not found: {task.verify_report}")
-    with open(p, encoding="utf-8") as fh:
-        data = json.load(fh)
+    try:
+        with open(p, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CorpusError(
+            f"task {task.id}: verify_report is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise CorpusError(
+            f"task {task.id}: verify_report must be a JSON object")
     return data, hashlib.sha256(json.dumps(
         data, sort_keys=True).encode()).hexdigest()

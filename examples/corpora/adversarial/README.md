@@ -21,3 +21,19 @@ full under `project/`. The traps, also recorded per-task in `corpus.json`:
    fails task adv-003.
 
 `patches/good-patch.diff` is the good recorded patch for adv-001.
+
+## Run it
+
+From the repository root:
+
+```bash
+ghostbench run examples/corpora/adversarial/corpus.json --out /tmp/bench-adv
+cat /tmp/bench-adv/BENCH.md
+```
+
+Expected outcome: adv-001 passes on its recorded patch, adv-002
+shows as a visible failure (broken patch plus a predicted hard
+gap), adv-003 scores `unknown` in Tier A (it needs a Recall run to
+score), and adv-004 has no recorded patch to score. A report with
+zero failures anywhere means something is wrong with the run, not
+that the corpus passed cleanly.

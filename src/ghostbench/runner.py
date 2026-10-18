@@ -30,8 +30,9 @@ from .corpus import (Corpus, Project, Task, list_project_files,
                      read_task_patch, read_verify_report)
 from .prices import estimate_input_cost_usd, load_price_table, price_table_date
 from .scoring import (manifest_hash_for_bundle, manifest_tokens,
-                      normalise_verify_report, parse_patch,
-                      saving_pct, score_files_touched)
+                      normalise_verify_report, parse_patch, saving_pct,
+                      score_expected_symbols, score_files_touched,
+                      _valid_token_count)
 from .tokens import (ESTIMATOR_SOURCE, ESTIMATOR_VERSION,
                      estimate_tokens, language_for_path, slice_version)
 
@@ -66,14 +67,32 @@ def _resolve_spec_path(corpus: Corpus, value: str) -> str:
     return os.path.normpath(os.path.join(corpus.base_dir, value))
 
 
+def _inside_project(project: Project, rel: str) -> str | None:
+    """Absolute path for rel if it stays inside the project root,
+    else None. An expected_file of '../outside.py' or '/etc/passwd'
+    must not let the derived sliced arm count files Bench was never
+    asked to measure (which also produced negative savings)."""
+    root = os.path.abspath(project.path)
+    full = os.path.abspath(os.path.join(root, rel))
+    if full != root and os.path.commonpath([root, full]) != root:
+        return None
+    return full
+
+
 def _variant_from_spec(corpus: Corpus, spec: dict) -> dict:
     """A variant supplied via bundle_dir / manifest / tokens."""
     out = {"tokens": None, "manifest_sha256": None, "source": "provided"}
-    if isinstance(spec.get("tokens"), int):
+    if not isinstance(spec, dict):
+        return out
+    if _valid_token_count(spec.get("tokens")):
         out["tokens"] = spec["tokens"]
         out["source"] = "provided-tokens"
     bundle_dir = spec.get("bundle_dir")
     manifest = spec.get("manifest")
+    if not isinstance(bundle_dir, str):
+        bundle_dir = None
+    if not isinstance(manifest, str):
+        manifest = None
     if bundle_dir:
         bdir = _resolve_spec_path(corpus, bundle_dir)
         out["manifest_sha256"] = manifest_hash_for_bundle(bundle_dir=bdir)
@@ -112,7 +131,14 @@ def _apply_patch_git(temp_root: str, patch_text: str) -> tuple[bool, str]:
 def _run_test_in_temp(project: Project, task: Task,
                         patch_text: str | None) -> dict:
     cmd = task.test_command
-    argv = shlex.split(cmd) if isinstance(cmd, str) else list(cmd or [])
+    try:
+        argv = shlex.split(cmd) if isinstance(cmd, str) else list(cmd or [])
+    except ValueError as exc:  # e.g. unbalanced quote in the command
+        return {"ran": False, "status": "bad-test-command",
+                "detail": str(exc)}
+    if not all(isinstance(part, str) for part in argv):
+        return {"ran": False, "status": "bad-test-command",
+                "detail": "test_command entries must be strings"}
     if not argv:
         return {"ran": False, "status": "no-test-command"}
     tmp = tempfile.mkdtemp(prefix="ghostbench-test-")
@@ -134,6 +160,11 @@ def _run_test_in_temp(project: Project, task: Task,
                     "output_tail": (proc.stdout + proc.stderr)[-1000:]}
         except subprocess.TimeoutExpired:
             return {"ran": True, "status": "timeout", "exit_code": None}
+        except OSError as exc:
+            # Missing binary / not executable: a scored outcome for
+            # this task, not a crash that loses the whole run.
+            return {"ran": True, "status": "error", "exit_code": None,
+                    "detail": str(exc)}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -141,6 +172,14 @@ def _run_test_in_temp(project: Project, task: Task,
 def run_task(corpus: Corpus, project: Project, task: Task, *,
                suite: str = "slice", run_tests: bool = False,
                model: str | None = None, table: dict | None = None) -> dict:
+    """Score one task in Tier A and return its report row.
+
+    The row carries the full and per-variant token estimates, the
+    normalised Verify verdict, the recorded-patch facts, the test
+    outcome, a ``status`` of ``pass`` / ``fail`` / ``unknown``, and
+    every failure reason in ``failures`` (failures are shown, never
+    hidden). Tests run only when ``run_tests`` is true, in a temp copy.
+    """
     failures: list[str] = []
     files = list_project_files(project.path)
     full_tokens = sum(_file_tokens(project, rel) for rel in files)
@@ -164,19 +203,30 @@ def run_task(corpus: Corpus, project: Project, task: Task, *,
             failures.append("sliced variant supplied but its token "
                             "total could not be determined from the manifest")
     else:
-        sliced_tokens = sum(
-            _file_tokens(project, rel) for rel in task.expected_files
-            if os.path.isfile(os.path.join(project.path, rel)))
+        sliced_tokens = 0
+        for rel in task.expected_files:
+            full = _inside_project(project, rel)
+            if full is not None and os.path.isfile(full):
+                sliced_tokens += _file_tokens(project, rel)
         sliced = {"tokens": sliced_tokens, "manifest_sha256": None,
                   "source": "derived:expected-files"}
     variants["sliced"] = sliced
 
-    wanted_extra = {"slice": [], "verify": ["verified"],
-                    "recall": ["recalled"], "proxy": ["proxied"]}[suite]
+    suite_extras = {"slice": [], "verify": ["verified"],
+                    "recall": ["recalled"], "proxy": ["proxied"]}
+    if suite not in suite_extras:
+        raise ValueError(
+            f"unknown suite: {suite!r} "
+            f"(expected one of {sorted(suite_extras)})")
+    wanted_extra = suite_extras[suite]
     for name, spec in (task.variants or {}).items():
         if name in ("full", "sliced"):
             continue
-        if wanted_extra and name not in wanted_extra:
+        # The suite gates which extra arm is measured. An empty
+        # wanted list (slice) means NO extra arm: the old truthiness
+        # check treated [] as 'no filter' and measured every extra
+        # variant in a slice run.
+        if name not in wanted_extra:
             continue
         variants[name] = _variant_from_spec(corpus, spec)
 
@@ -204,6 +254,33 @@ def run_task(corpus: Corpus, project: Project, task: Task, *,
     patch = parse_patch(patch_text) if patch_text is not None else None
     files_score = score_files_touched(patch, task.expected_files)
 
+    # Expected-symbol coverage: the derived sliced arm is built from
+    # expected_files, so an expected symbol absent from those files is
+    # a symbol the slice cannot contain - a real gap, surfaced as a
+    # failure like a Verify hard gap. When the sliced arm is a provided
+    # bundle/manifest Bench cannot inspect its contents, so the check
+    # is reported descriptively and does NOT gate the task (Bench
+    # surfaces what it cannot measure instead of guessing).
+    file_texts = {}
+    for rel in task.expected_files:
+        text = _read_text(os.path.join(project.path, rel))
+        if text is not None:
+            file_texts[rel] = text
+    symbols_score = score_expected_symbols(
+        task.expected_symbols, file_texts, patch_text)
+    sliced_source = variants["sliced"].get("source")
+    symbols_score["sliced_source"] = sliced_source
+    applies_to_sliced = sliced_source == "derived:expected-files"
+    symbols_score["applies_to_sliced"] = applies_to_sliced
+    missing_slice_symbols = (
+        symbols_score["missing_from_expected_files"]
+        if applies_to_sliced else [])
+    if missing_slice_symbols:
+        failures.append(
+            "expected symbol(s) missing from sliced context "
+            "(derived from expected_files): "
+            + ", ".join(missing_slice_symbols))
+
     test_result = {"ran": False, "status": "not-run"}
     if run_tests and task.test_command:
         test_result = _run_test_in_temp(project, task, patch_text)
@@ -219,11 +296,13 @@ def run_task(corpus: Corpus, project: Project, task: Task, *,
             failures.append("recorded patch is empty")
         if hard_gaps:
             patch_fail = True
+        if missing_slice_symbols:
+            patch_fail = True
         if not files_score["matched_files"]:
             patch_fail = True
             failures.append("recorded patch touches no expected file")
         status = "fail" if patch_fail else "pass"
-    elif hard_gaps:
+    elif hard_gaps or missing_slice_symbols:
         status = "fail"
     else:
         status = "unknown"
@@ -242,6 +321,7 @@ def run_task(corpus: Corpus, project: Project, task: Task, *,
         "soft_gaps_predicted": len(verify["soft_gaps"]),
         "patch": patch,
         "files_touched_score": files_score,
+        "symbols_score": symbols_score,
         "test": test_result,
         "status": status,
         "failures": failures,
@@ -252,6 +332,13 @@ def run_task(corpus: Corpus, project: Project, task: Task, *,
 def run_corpus(corpus: Corpus, *, suite: str = "slice",
                run_tests: bool = False, task_filter: set | None = None,
                model: str | None = None) -> dict:
+    """Run Tier A over a corpus and return the full report dict.
+
+    ``task_filter``, when given, restricts the run to those task ids;
+    the report then labels itself a subset. The returned dict is
+    exactly what ``report.write_json_report`` serialises, including
+    version stamps and the ``honest_scope`` box.
+    """
     table = load_price_table()
     rows = []
     for project, task in corpus.all_tasks():
@@ -266,7 +353,20 @@ def run_corpus(corpus: Corpus, *, suite: str = "slice",
                     "unknown": sum(1 for r in rows if r["status"] == "unknown"),
                     "hard_gaps_predicted": sum(
                         r["hard_gaps_predicted"] for r in rows),
+                    "expected_symbols": sum(
+                        len(r["symbols_score"]["expected_symbols"])
+                        for r in rows),
+                    "symbols_found": sum(
+                        len(r["symbols_score"]["found_in_expected_files"])
+                        for r in rows),
+                    "tasks_with_missing_symbols": sum(
+                        1 for r in rows
+                        if r["symbols_score"]["applies_to_sliced"]
+                        and r["symbols_score"]["missing_from_expected_files"]),
                     "variants": {}}
+    totals["symbol_coverage_pct"] = (
+        round(totals["symbols_found"] * 100.0 / totals["expected_symbols"], 1)
+        if totals["expected_symbols"] else None)
     variant_names = sorted({n for r in rows for n in r["variants"]})
     for name in variant_names:
         toks = [r["variants"][name]["tokens"] for r in rows
@@ -330,6 +430,11 @@ def run_corpus(corpus: Corpus, *, suite: str = "slice",
 
 
 def append_ledger(report: dict, ledger_path: str) -> str:
+    """Append one stamped summary record for ``report`` to the ledger.
+
+    The ledger is JSON Lines (``.ghostbench-history.jsonl`` by
+    default). Returns ``ledger_path``.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(ledger_path)), exist_ok=True)
     record = {
         "ts": report["created_utc"], "run_id": report["run_id"],
@@ -345,12 +450,21 @@ def append_ledger(report: dict, ledger_path: str) -> str:
 
 
 def read_ledger(ledger_path: str) -> list[dict]:
+    """Read all ledger records; an absent ledger reads as an empty list."""
     if not os.path.isfile(ledger_path):
         return []
     out = []
     with open(ledger_path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
-            if line:
-                out.append(json.loads(line))
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                # A torn final line (crash mid-append) must not make
+                # the whole history unreadable.
+                continue
+            if isinstance(record, dict):
+                out.append(record)
     return out

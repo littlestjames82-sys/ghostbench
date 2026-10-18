@@ -36,6 +36,13 @@ def preflight(corpus: Corpus, *, agent: str = "claude-code",
               budget_tokens: int | None = None,
               model: str | None = "claude-sonnet",
               task_filter: set | None = None) -> dict:
+    """Build the Tier B preflight shown to the user before any run.
+
+    Lists each task with its estimated full-context tokens and input
+    cost, plus the both-arms total. All figures are estimates from the
+    local price table. Raises :class:`TierBRefusal` for an unsupported
+    agent. This function never runs an agent and never spends.
+    """
     if agent not in SUPPORTED_AGENTS:
         raise TierBRefusal(
             f"Tier B v0.1 supports one agent only: {', '.join(SUPPORTED_AGENTS)} "
@@ -72,7 +79,12 @@ def check_budget(pre: dict, tokens_used: int) -> bool:
     """True while usage is within the cap; caller MUST stop at cap
     and report partial results as partial (PLAN.md budget test)."""
     cap = pre.get("budget_tokens")
-    if cap is None:
+    if cap is None or isinstance(cap, bool) \
+            or not isinstance(cap, (int, float)):
+        return False
+    if isinstance(tokens_used, bool) \
+            or not isinstance(tokens_used, (int, float)) \
+            or tokens_used < 0:
         return False
     return tokens_used <= cap
 
@@ -82,9 +94,21 @@ def run_live(corpus: Corpus, *, agent: str = "claude-code",
              model: str | None = "claude-sonnet",
              confirm: bool = False, task_filter: set | None = None,
              executor=None) -> dict:
+    """Enforce the Tier B gates in order, then delegate to ``executor``.
+
+    Gate order: positive budget cap, explicit ``confirm``, then --
+    only when no executor is injected -- the
+    ``GHOSTBENCH_ENABLE_LIVE=1`` check and the v0.1 "no executor
+    wired" refusal. Every refusal raises :class:`TierBRefusal` with a
+    user-facing message stating nothing was spent. An injected
+    executor receives the preflight dict and its return value is
+    returned unchanged.
+    """
     pre = preflight(corpus, agent=agent, budget_tokens=budget_tokens,
                     model=model, task_filter=task_filter)
-    if budget_tokens is None or budget_tokens <= 0:
+    if budget_tokens is None or isinstance(budget_tokens, bool) \
+            or not isinstance(budget_tokens, (int, float)) \
+            or budget_tokens <= 0:
         raise TierBRefusal(
             "a positive --budget token cap is required. "
             "Bench never spends without a cap.")
@@ -96,7 +120,10 @@ def run_live(corpus: Corpus, *, agent: str = "claude-code",
         raise TierBRefusal(
             "explicit confirmation is required after "
             "reviewing the preflight (tasks, model, estimated cost, cap).")
-    if executor is None and os.environ.get(LIVE_ENV) != "1":
+    # Gate 3 applies to EVERY executor, injected ones included: an
+    # injected executor must not be able to spend just because the
+    # caller supplied one while the env gate is off.
+    if os.environ.get(LIVE_ENV) != "1":
         raise TierBRefusal(
             f"live execution is gated OFF by default. "
             f"Set {LIVE_ENV}=1 to enable a wired executor. "
@@ -105,7 +132,7 @@ def run_live(corpus: Corpus, *, agent: str = "claude-code",
         raise TierBRefusal(
             "no live executor is wired in this v0.1 "
             "core build. No model was called and nothing was spent.")
-    return executor(pre)  # pragma: no cover - injected executors only
+    return executor(pre)
 
 
 def mark_flaky(task_rows: list[dict]) -> list[dict]:

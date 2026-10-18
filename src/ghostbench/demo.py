@@ -99,6 +99,14 @@ VERIFY_BAD = {
 
 
 def make_demo_corpus(target_dir: str) -> str:
+    """Write the starter demo corpus into ``target_dir``.
+
+    Creates the adversarial project, two recorded patches, one Verify
+    report, and ``corpus.json`` under that directory. Returns the
+    corpus file path, ready for ``ghostbench run <path>``. One of the
+    two demo tasks is designed to fail visibly (see the module
+    docstring).
+    """
     root = os.path.abspath(target_dir)
     proj = os.path.join(root, "projects", "adversarial")
     os.makedirs(os.path.join(proj, "src"), exist_ok=True)

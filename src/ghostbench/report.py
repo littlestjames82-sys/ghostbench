@@ -12,6 +12,7 @@ import os
 
 
 def write_json_report(report: dict, path: str) -> str:
+    """Write ``report`` as ``bench-report.json`` (sorted keys). Returns ``path``."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, sort_keys=True)
@@ -24,6 +25,11 @@ def _fmt(value, suffix=""):
 
 
 def render_bench_md(report: dict) -> str:
+    """Render a report dict as the human ``BENCH.md`` text.
+
+    Raises ``ValueError`` for a report with no per-task rows: a
+    summary with no rows is not a valid Bench report.
+    """
     if not report.get("tasks"):
         raise ValueError("a Bench report with no per-task rows is not "
                          "a valid report (PLAN.md section 4)")
@@ -66,21 +72,33 @@ def render_bench_md(report: dict) -> str:
     lines.append(f"- Tasks: {t['tasks']} (pass {t['pass']}, "
                  f"fail {t['fail']}, unknown {t['unknown']})")
     lines.append(f"- Hard gaps predicted (Verify): {t['hard_gaps_predicted']}")
+    if t.get("expected_symbols"):
+        lines.append(
+            f"- Expected symbols found in expected files: "
+            f"{t.get('symbols_found')}/{t['expected_symbols']} "
+            f"({_fmt(t.get('symbol_coverage_pct'), '%')}), "
+            f"tasks with missing symbols: "
+            f"{t.get('tasks_with_missing_symbols')}")
     lines.append("")
     lines.append("## Per-task results")
     lines.append("")
     lines.append("| Project | Task | Status | Full | Sliced | Saving % | "
-                 "Hard gaps | Patch files | Manifest (sliced) |")
-    lines.append("|---|---|---|---:|---:|---:|---:|---|---|")
+                 "Hard gaps | Symbols | Patch files | Manifest (sliced) |")
+    lines.append("|---|---|---|---:|---:|---:|---:|---|---|---|")
     for row in report["tasks"]:
         sliced = row["variants"].get("sliced", {})
         patch_files = ", ".join(
             (row.get("patch") or {}).get("files_touched") or []) or "-"
+        symbols = row.get("symbols_score") or {}
+        symbols_cell = (
+            f"{len(symbols.get('found_in_expected_files') or [])}/"
+            f"{len(symbols.get('expected_symbols') or [])}"
+            if symbols.get("expected_symbols") else "-")
         lines.append(
             f"| {row['project']} | {row['task']} | {row['status']} | "
             f"{row['full_tokens']} | {_fmt(sliced.get('tokens'))} | "
             f"{_fmt(sliced.get('saving_pct_vs_full'))} | "
-            f"{row['hard_gaps_predicted']} | {patch_files} | "
+            f"{row['hard_gaps_predicted']} | {symbols_cell} | {patch_files} | "
             f"{_fmt(sliced.get('manifest_sha256'))} |")
     lines.append("")
     lines.append("## Failures (all shown)")
@@ -104,16 +122,38 @@ def render_bench_md(report: dict) -> str:
 
 
 def write_bench_md(report: dict, path: str) -> str:
+    """Write :func:`render_bench_md` output to ``path``. Returns ``path``."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(render_bench_md(report))
     return path
 
 
+def _require_report_shape(rep, label: str) -> None:
+    if not isinstance(rep, dict):
+        raise ValueError(f"{label} is not a bench report (not a JSON object)")
+    for key in ("run_id", "corpus", "estimator_version", "totals", "tasks"):
+        if key not in rep:
+            raise ValueError(f"{label} is not a bench report (missing {key!r})")
+    if not isinstance(rep["tasks"], list) or not isinstance(rep["totals"], dict):
+        raise ValueError(f"{label} is not a bench report (bad totals/tasks)")
+    for key in ("full_tokens", "pass", "fail"):
+        if key not in rep["totals"]:
+            raise ValueError(
+                f"{label} is not a bench report (totals missing {key!r})")
+
+
 def compare_reports(a: dict, b: dict) -> dict:
     """Per-task and total deltas between two run reports (b - a)."""
+    _require_report_shape(a, "run A")
+    _require_report_shape(b, "run B")
     def by_key(rep):
-        return {(r["project"], r["task"]): r for r in rep["tasks"]}
+        out = {}
+        for r in rep["tasks"]:
+            if not isinstance(r, dict) or "project" not in r or "task" not in r:
+                raise ValueError("bench report task row missing project/task")
+            out[(r["project"], r["task"])] = r
+        return out
     ka, kb = by_key(a), by_key(b)
     rows = []
     for key in sorted(set(ka) | set(kb)):
@@ -152,7 +192,8 @@ def compare_reports(a: dict, b: dict) -> dict:
 
 
 def render_compare_md(comp: dict) -> str:
-    lines = [f"# GhostBench Compare", "",
+    """Render a :func:`compare_reports` result as a Markdown table."""
+    lines = ["# GhostBench Compare", "",
              f"- A: {comp['run_a']}", f"- B: {comp['run_b']}"]
     if comp["estimator_mismatch_warning"]:
         lines.append(f"- WARNING: {comp['estimator_mismatch_warning']}")

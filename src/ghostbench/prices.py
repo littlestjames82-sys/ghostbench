@@ -28,6 +28,12 @@ _FALLBACK = {
 
 
 def load_price_table() -> dict:
+    """Load the local price table (see the module docstring for the order).
+
+    The returned dict carries a ``_source`` key naming where the table
+    came from, so reports can stamp it. Falls back to the built-in
+    dated snapshot when no file is found.
+    """
     env = os.environ.get("GHOSTBENCH_PRICES")
     candidates = []
     if env:
@@ -47,15 +53,22 @@ def load_price_table() -> dict:
             try:
                 with open(cand, encoding="utf-8") as fh:
                     data = json.load(fh)
-                data["_source"] = cand
-                return data
             except (OSError, json.JSONDecodeError):
                 continue
+            if not isinstance(data, dict):
+                # Valid JSON, wrong shape (e.g. a list): not a price
+                # table. Skip it instead of crashing on data[...].
+                continue
+            data["_source"] = cand
+            return data
     return dict(_FALLBACK)
 
 
 def price_table_date(table: dict | None = None) -> str | None:
+    """Return the price table's ``as_of`` (or ``date``) stamp, or ``None``."""
     table = table or load_price_table()
+    if not isinstance(table, dict):
+        return None
     return table.get("as_of") or table.get("date")
 
 
@@ -65,11 +78,27 @@ def estimate_input_cost_usd(tokens: int, model: str | None,
     None when the model is unknown: unknown is stated, not guessed."""
     if model is None:
         return None
+    if isinstance(tokens, bool) or not isinstance(tokens, (int, float)) \
+            or tokens < 0:
+        return None
     table = table or load_price_table()
-    for entry in table.get("models") or []:
+    if not isinstance(table, dict):
+        return None
+    models = table.get("models")
+    if not isinstance(models, list):
+        return None
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
         if entry.get("id") == model:
             rate = entry.get("input_per_mtok_usd")
-            if rate is None:
+            if rate is None or isinstance(rate, bool):
                 return None
-            return round(tokens * float(rate) / 1_000_000, 6)
+            try:
+                rate = float(rate)
+            except (TypeError, ValueError):
+                return None
+            if rate < 0:
+                return None
+            return round(tokens * rate / 1_000_000, 6)
     return None

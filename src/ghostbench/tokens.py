@@ -23,6 +23,7 @@ try:  # Prefer the real GhostSlice estimator when available.
     ESTIMATOR_VERSION = f"ghostslice-estimator-v{_GS_METHOD_VERSION}"
 
     def estimate_tokens(text: str, language: str | None = None) -> int:
+        """Estimate tokens with the installed GhostSlice estimator."""
         return _gs_estimate(text, language)
 
 except Exception:  # pragma: no cover - exercised only without Slice
@@ -62,6 +63,7 @@ except Exception:  # pragma: no cover - exercised only without Slice
         return fam
 
     def estimate_tokens(text: str, language: str | None = None) -> int:
+        """Estimate tokens with the fallback v2-compatible formula."""
         if not text:
             return 0
         raw = 0
@@ -88,6 +90,11 @@ EXT_LANGUAGE = {
 
 
 def language_for_path(path: str) -> str | None:
+    """Return the scanner-style language label for ``path``, or ``None``.
+
+    Based only on the file extension (see ``EXT_LANGUAGE``); unknown
+    extensions return ``None``.
+    """
     import os
     return EXT_LANGUAGE.get(os.path.splitext(path)[1].lower())
 
