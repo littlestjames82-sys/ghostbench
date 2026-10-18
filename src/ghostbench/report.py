@@ -24,6 +24,23 @@ def _fmt(value, suffix=""):
     return "-" if value is None else f"{value}{suffix}"
 
 
+#: Plain-words rendering of the evidence contract's
+#: verification_level enum, so the first screen of BENCH.md cannot
+#: be skim-read as stronger evidence than it is.
+_LEVEL_WORDS = {
+    "static-analysis": "static analysis only (no tests executed, "
+                       "no live agent run)",
+    "tests-executed": "tests executed in the contained runner "
+                      "(no live agent run)",
+    "live-agent": "live agent run (a real agent attempted the tasks)",
+    "none": "no usable evidence (nothing was measured)",
+}
+
+
+def _level_words(level) -> str:
+    return _LEVEL_WORDS.get(level, "not recorded (pre-contract report)")
+
+
 def render_bench_md(report: dict) -> str:
     """Render a report dict as the human ``BENCH.md`` text.
 
@@ -35,10 +52,22 @@ def render_bench_md(report: dict) -> str:
                          "a valid report (PLAN.md section 4)")
     t = report["totals"]
     lines = []
+    if report.get("sample"):
+        lines.append("# *** SAMPLE REPORT - NOT A REAL RUN ***")
+        lines.append("")
+        lines.append("This is sample material shipped with GhostBench "
+                     "to show the report shape. It is not evidence "
+                     "from a real bench run.")
+        if report.get("sample_note"):
+            lines.append(f"Sample note: {report['sample_note']}")
+        lines.append("")
     lines.append(f"# GhostBench Report - {report['corpus']['name']}")
     lines.append("")
     lines.append(f"- Run: {report['run_id']}")
     lines.append(f"- Tier: {report['tier']} | Suite: {report['suite']}")
+    level = report.get("verification_level")
+    lines.append(f"- Verification level: {_fmt(level)} - "
+                 f"{_level_words(level)}")
     lines.append(f"- Tool: ghostbench {report['tool_version']}")
     lines.append(f"- Corpus: {report['corpus']['name']} "
                  f"v{report['corpus']['version']}")
@@ -59,6 +88,18 @@ def render_bench_md(report: dict) -> str:
     for item in report["honest_scope"]["what_was_not_measured"]:
         lines.append(f"- Not measured: {item}")
     lines.append("")
+    sandbox = report.get("sandbox")
+    if sandbox:
+        lines.append("## Test execution containment")
+        lines.append("")
+        lines.append("Task tests ran in the contained runner. It "
+                     "enforces:")
+        for item in sandbox.get("enforced") or []:
+            lines.append(f"- Enforced: {item}")
+        lines.append("It does NOT enforce:")
+        for item in sandbox.get("not_enforced") or []:
+            lines.append(f"- Not enforced: {item}")
+        lines.append("")
     lines.append("## Totals")
     lines.append("")
     lines.append(f"- Full tokens (estimated): {t['full_tokens']}")
@@ -82,9 +123,9 @@ def render_bench_md(report: dict) -> str:
     lines.append("")
     lines.append("## Per-task results")
     lines.append("")
-    lines.append("| Project | Task | Status | Full | Sliced | Saving % | "
+    lines.append("| Project | Task | Status | Level | Full | Sliced | Saving % | "
                  "Hard gaps | Symbols | Patch files | Manifest (sliced) |")
-    lines.append("|---|---|---|---:|---:|---:|---:|---|---|---|")
+    lines.append("|---|---|---|---|---:|---:|---:|---:|---|---|---|")
     for row in report["tasks"]:
         sliced = row["variants"].get("sliced", {})
         patch_files = ", ".join(
@@ -96,6 +137,7 @@ def render_bench_md(report: dict) -> str:
             if symbols.get("expected_symbols") else "-")
         lines.append(
             f"| {row['project']} | {row['task']} | {row['status']} | "
+            f"{_fmt(row.get('verification_level'))} | "
             f"{row['full_tokens']} | {_fmt(sliced.get('tokens'))} | "
             f"{_fmt(sliced.get('saving_pct_vs_full'))} | "
             f"{row['hard_gaps_predicted']} | {symbols_cell} | {patch_files} | "

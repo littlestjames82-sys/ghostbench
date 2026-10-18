@@ -1,11 +1,13 @@
-# GhostBench Report - adversarial
+# *** SAMPLE REPORT - NOT A REAL RUN ***
 
-> SAMPLE format example only, in the shape written by the core report
-> writer. Numbers are illustrative and were NOT produced by a bench
-> run. Do not quote as results.
+This is sample material shipped with GhostBench to show the report shape. It is not evidence from a real bench run.
+Sample note: SAMPLE format example only. Numbers are illustrative and were NOT produced by a bench run. Do not quote as results.
+
+# GhostBench Report - adversarial
 
 - Run: SAMPLE-run-a
 - Tier: A | Suite: slice
+- Verification level: static-analysis - static analysis only (no tests executed, no live agent run)
 - Tool: ghostbench 0.1.0
 - Corpus: adversarial v0.1.0
 - GhostSlice version: sample
@@ -28,10 +30,10 @@
 
 ## Per-task results
 
-| Project | Task | Status | Full | Sliced | Saving % | Hard gaps | Patch files | Manifest (sliced) |
-|---|---|---|---:|---:|---:|---:|---|---|
-| adversarial | adv-001-fix-missing-route | pass | 4200 | 1000 | 76.2 | 0 | shop/helpers.py | sha256:21198084e68cf1118905c699c3b0a819b59029d4f026ed5f4b8d1eba5afc1dac |
-| adversarial | adv-002-broken-patch-missing-symbol | fail | 4200 | 1000 | 76.2 | 1 | shop/helpers.py | sha256:21198084e68cf1118905c699c3b0a819b59029d4f026ed5f4b8d1eba5afc1dac |
+| Project | Task | Status | Level | Full | Sliced | Saving % | Hard gaps | Symbols | Patch files | Manifest (sliced) |
+|---|---|---|---|---:|---:|---:|---:|---|---|---|
+| adversarial | adv-001-fix-missing-route | pass | static-analysis | 4200 | 1000 | 76.2 | 0 | - | shop/helpers.py | sha256:21198084e68cf1118905c699c3b0a819b59029d4f026ed5f4b8d1eba5afc1dac |
+| adversarial | adv-002-broken-patch-missing-symbol | fail | static-analysis | 4200 | 1000 | 76.2 | 1 | - | shop/helpers.py | sha256:21198084e68cf1118905c699c3b0a819b59029d4f026ed5f4b8d1eba5afc1dac |
 
 ## Failures (all shown)
 
@@ -40,3 +42,4 @@
 ## Traceability
 
 - Every token number comes from the estimator stamped above or from a bundle manifest whose sha256 is in bench-report.json for the same run.
+- Reported (provider) token figures are never blended with estimates; Tier A has no reported figures.

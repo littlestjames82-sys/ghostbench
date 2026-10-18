@@ -28,6 +28,7 @@
   "model_for_cost_estimates": null,
   "price_table_date": "sample",
   "price_table_source": "sample",
+  "provenance": "sample",
   "run_id": "SAMPLE-run-a",
   "run_tests": false,
   "sample": true,
@@ -97,6 +98,7 @@
           "tokens": 1000
         }
       },
+      "verification_level": "static-analysis",
       "verify": {
         "hard_gaps": [],
         "present": false,
@@ -165,6 +167,7 @@
           "tokens": 1000
         }
       },
+      "verification_level": "static-analysis",
       "verify": {
         "hard_gaps": [
           {
@@ -198,5 +201,6 @@
         "tokens": 2000
       }
     }
-  }
+  },
+  "verification_level": "static-analysis"
 }

@@ -12,18 +12,31 @@ Tier A builds, per task:
 
 Recorded patches get a static pass (files touched, Verify hard
 gaps). Tests are NOT run unless the caller explicitly passes
-run_tests=True, in which case they run in a temporary copy.
+run_tests=True, in which case they run in a temporary copy under
+the contained test runner below: scrubbed environment, patch-path
+containment validated before ``git apply``, escaping symlinks in
+the copied tree skipped and recorded, POSIX resource limits where
+the OS allows. What that runner does NOT enforce (host filesystem
+writes by the test process, network access) is stated in every
+test result's ``sandbox`` block - it is a contained working copy,
+not an OS sandbox, and Bench says so rather than claiming more.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import tempfile
 from datetime import datetime, timezone
+
+try:
+    import resource  # POSIX only; limits are best-effort elsewhere
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    resource = None
 
 from . import __version__
 from .corpus import (Corpus, Project, Task, list_project_files,
@@ -110,6 +123,293 @@ def _variant_from_spec(corpus: Corpus, spec: dict) -> dict:
     return out
 
 
+# ------------------------------------------------------------------
+# Contained test execution (evidence contract, Oct 18 2026)
+#
+# A task's test_command and recorded patch are untrusted input: an
+# agent wrote them. The runner below is the only place Bench executes
+# either. It enforces what pure Python + git can enforce, and every
+# test result carries a ``sandbox`` block stating plainly what is
+# enforced and what is NOT - host filesystem writes by the test
+# process and network access are not OS-enforced here, so a
+# tests-executed verdict means "ran in this contained copy", never
+# "ran in a sandbox".
+# ------------------------------------------------------------------
+
+#: verification_level enum (shared evidence contract). Rank order:
+#: a report's level is the strongest level among its task rows.
+VERIFICATION_LEVELS = ("none", "static-analysis", "tests-executed",
+                       "live-agent")
+_LEVEL_RANK = {name: i for i, name in enumerate(VERIFICATION_LEVELS)}
+
+#: Output retained from a test process: the last this many
+#: characters of combined stdout+stderr. The process's full output
+#: is never stored in a report.
+OUTPUT_TAIL_CHARS = 1000
+
+#: POSIX resource limits for the test process (best-effort: applied
+#: via preexec_fn where the OS allows, silently absent elsewhere).
+TEST_CPU_SECONDS = 110          # just under the 120s wall timeout
+TEST_FILE_SIZE_BYTES = 64 * 1024 * 1024
+TEST_ADDRESS_SPACE_BYTES = 2 * 1024 * 1024 * 1024
+
+SANDBOX_ENFORCED = [
+    "environment scrubbed to an allowlist (PATH, LANG/LC_*, TMPDIR "
+    "and HOME inside the temp area); parent-process secrets never "
+    "reach the test process",
+    "patch paths validated before git apply: '../', absolute, and "
+    "symlink-escaping paths are refused, not applied",
+    "project copied to a fresh temp directory; symlinks whose "
+    "targets resolve outside the project are skipped and recorded, "
+    "never followed",
+    "wall-clock timeout of 120s on the test process",
+    "captured output capped (last 1000 characters kept)",
+    "POSIX resource limits where the OS allows: CPU seconds, "
+    "max file size, address space, no core dump",
+]
+
+SANDBOX_NOT_ENFORCED = [
+    "host filesystem writes by the test process are NOT prevented: "
+    "the process runs with the user's permissions outside an OS "
+    "sandbox and could write outside the temp copy",
+    "network access is NOT blocked or monitored",
+    "resource limits are best-effort POSIX rlimits, absent on "
+    "non-POSIX platforms",
+]
+
+
+def strongest_verification_level(levels) -> str:
+    """Strongest verification level among ``levels`` (contract rank:
+    none < static-analysis < tests-executed < live-agent). Unknown
+    values count as ``none``; an empty input is ``none``."""
+    best = "none"
+    for level in levels:
+        if _LEVEL_RANK.get(level, 0) > _LEVEL_RANK[best]:
+            best = level
+    return best
+
+
+def _sandbox_block(skipped_symlinks) -> dict:
+    """The honest sandbox statement attached to every executed (or
+    attempted) test result. Fresh lists each call: results are
+    serialised into reports and must not share mutable state."""
+    return {"enforced": list(SANDBOX_ENFORCED),
+            "not_enforced": list(SANDBOX_NOT_ENFORCED),
+            "skipped_symlinks": list(skipped_symlinks)}
+
+
+def _scrubbed_env(tmp: str, dest: str) -> dict:
+    """Minimal allowlist environment for the test process.
+
+    The parent process's environment is NEVER inherited wholesale:
+    API keys and other secrets an agent shell happens to carry must
+    not reach untrusted test code. Only benign locale/path variables
+    pass, and HOME/TMPDIR point inside the per-run temp area so
+    tools that need a writable home land in the contained copy.
+    """
+    env = {}
+    for key in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SystemRoot",
+                "WINDIR", "COMSPEC", "PATHEXT"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    env["HOME"] = dest
+    env["TMPDIR"] = tmp
+    env["TEMP"] = tmp
+    env["TMP"] = tmp
+    # Keep test output deterministic and machine-readable.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
+    return env
+
+
+def _apply_resource_limits() -> None:
+    """preexec_fn for the test process: POSIX rlimits, best-effort.
+
+    Runs in the child after fork, before exec. Any limit the OS
+    refuses is skipped silently - the wall-clock timeout and the
+    report's not_enforced list cover the gap honestly.
+    """
+    if resource is None:  # pragma: no cover - non-POSIX
+        return
+    limits = [
+        (resource.RLIMIT_CPU, TEST_CPU_SECONDS),
+        (resource.RLIMIT_FSIZE, TEST_FILE_SIZE_BYTES),
+        (resource.RLIMIT_CORE, 0),
+    ]
+    if hasattr(resource, "RLIMIT_AS"):
+        limits.append((resource.RLIMIT_AS, TEST_ADDRESS_SPACE_BYTES))
+    for what, value in limits:
+        try:
+            _soft, hard = resource.getrlimit(what)
+            if hard != resource.RLIM_INFINITY and hard < value:
+                value = hard
+            resource.setrlimit(what, (value, value))
+        except (ValueError, OSError):
+            continue
+
+
+_DIFF_GIT_RE = re.compile(r"^diff --git (.+?) (.+)$")
+_OLD_FILE_RE2 = re.compile(r"^--- (.+)$")
+_NEW_FILE_RE2 = re.compile(r"^\+\+\+ (.+)$")
+_MODE_RE = re.compile(r"^(?:new file mode|old mode|new mode) (\d+)$")
+
+
+def _strip_diff_prefix(path: str) -> str:
+    """Remove the a/ or b/ prefix git puts on diff header paths."""
+    if path[:2] in ("a/", "b/"):
+        return path[2:]
+    return path
+
+
+def _collect_patch_entries(patch_text: str) -> list[dict]:
+    """Per-file entries of a unified diff: every path the patch can
+    write to (the +++ target, plus the --- source for renames and
+    deletions) and, for symlink creations (mode 120000), the link
+    target recorded in the added body line."""
+    entries: list[dict] = []
+    current: dict | None = None
+    in_hunk = False
+
+    def _add_path(entry, raw):
+        if raw != "/dev/null":
+            path = _strip_diff_prefix(raw)
+            if path not in entry["paths"]:
+                entry["paths"].append(path)
+
+    for line in (patch_text or "").splitlines():
+        m = _DIFF_GIT_RE.match(line)
+        if m:
+            current = {"paths": [], "symlink_target": None}
+            entries.append(current)
+            in_hunk = False
+            for raw in m.groups():
+                _add_path(current, raw.strip().strip('"'))
+            continue
+        if line.startswith(("--- ", "+++ ")) and current is None:
+            # A headerless diff (no 'diff --git' line): git apply
+            # accepts these, so the validator must see them too.
+            current = {"paths": [], "symlink_target": None}
+            entries.append(current)
+            in_hunk = False
+        if current is None:
+            continue
+        m = _MODE_RE.match(line)
+        if m:
+            current["is_symlink"] = (m.group(1) == "120000")
+            continue
+        m = _OLD_FILE_RE2.match(line)
+        if m and not in_hunk:
+            _add_path(current, m.group(1).strip().strip('"'))
+            continue
+        m = _NEW_FILE_RE2.match(line)
+        if m and not in_hunk:
+            _add_path(current, m.group(1).strip().strip('"'))
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if in_hunk and line.startswith("+") \
+                and current.get("is_symlink") \
+                and current["symlink_target"] is None:
+            current["symlink_target"] = line[1:]
+    return entries
+
+
+def _contained_in(root_resolved: str, candidate: str) -> bool:
+    """True when ``candidate`` (already resolved) is root or inside it."""
+    return candidate == root_resolved or os.path.commonpath(
+        [root_resolved, candidate]) == root_resolved
+
+
+def _validate_patch_paths(patch_text: str, dest: str) -> list[str]:
+    """Refuse patch paths that escape the temp copy BEFORE git apply.
+
+    Follows the GhostVerify pattern (its patch.py ``_safe_target``):
+    a patch path is attacker-shaped input. ``../`` segments climb
+    out, an absolute path ignores the root, and a symlinked parent
+    inside the copy can point outside it - so every path is checked
+    after resolution against the resolved copy root, including paths
+    that traverse a symlink the same patch creates. Returns a list
+    of problems; empty means the patch may go to git apply (which
+    remains a second line of defence, not the only one).
+    """
+    problems: list[str] = []
+    root = os.path.realpath(dest)
+    created_links: dict[str, str] = {}  # rel link path -> resolved target
+    for entry in _collect_patch_entries(patch_text):
+        for rel in entry["paths"]:
+            if os.path.isabs(rel):
+                problems.append(f"patch path is absolute: {rel!r}")
+                continue
+            resolved = os.path.realpath(os.path.join(root, rel))
+            if not _contained_in(root, resolved):
+                problems.append(
+                    f"patch path escapes the temporary copy: {rel!r}")
+                continue
+            # A path through a symlink this same patch creates must
+            # stay inside too, wherever that symlink points.
+            parts = rel.replace("\\", "/").split("/")
+            for i in range(1, len(parts)):
+                parent = "/".join(parts[:i])
+                if parent in created_links:
+                    through = os.path.realpath(os.path.join(
+                        created_links[parent], *parts[i:]))
+                    if not _contained_in(root, through):
+                        problems.append(
+                            f"patch path escapes the temporary copy "
+                            f"through a symlink the patch creates: "
+                            f"{rel!r}")
+                    break
+        if entry.get("is_symlink"):
+            target = entry.get("symlink_target")
+            for rel in entry["paths"]:
+                link_abs = os.path.join(root, rel)
+                if target is None:
+                    resolved_target = link_abs  # unknown: treat as self
+                elif os.path.isabs(target):
+                    resolved_target = os.path.realpath(target)
+                else:
+                    resolved_target = os.path.realpath(
+                        os.path.join(os.path.dirname(link_abs), target))
+                created_links[rel.replace("\\", "/")] = resolved_target
+                if not _contained_in(root, resolved_target):
+                    problems.append(
+                        f"patch creates a symlink escaping the "
+                        f"temporary copy: {rel!r} -> {target!r}")
+    return problems
+
+
+def _copy_project_safely(src: str, dest: str) -> list[str]:
+    """Copy the project tree, never following an escaping symlink.
+
+    ``shutil.copytree`` with its default settings silently follows
+    symlinks, which copies content from OUTSIDE the project into the
+    test copy (and a dangling symlink crashes the copy). Here a
+    symlink whose target resolves outside the project is skipped
+    and recorded; a symlink to somewhere inside the project is
+    copied as the regular file/directory it points at, as before.
+    Returns the sorted project-relative paths of skipped symlinks.
+    """
+    root = os.path.realpath(src)
+    skipped: list[str] = []
+
+    def _copy_one(src_path, dst_path):
+        if os.path.islink(src_path):
+            resolved = os.path.realpath(src_path)
+            if not _contained_in(root, resolved) \
+                    or not os.path.exists(resolved):
+                skipped.append(os.path.relpath(src_path, src))
+                return dst_path
+        return shutil.copy2(src_path, dst_path)
+
+    shutil.copytree(src, dest, copy_function=_copy_one,
+                    ignore=shutil.ignore_patterns(
+                        ".git", "__pycache__", "node_modules"))
+    return sorted(skipped)
+
+
 def _apply_patch_git(temp_root: str, patch_text: str) -> tuple[bool, str]:
     patch_file = os.path.join(temp_root, ".ghostbench-patch.diff")
     with open(patch_file, "w", encoding="utf-8") as fh:
@@ -144,27 +444,46 @@ def _run_test_in_temp(project: Project, task: Task,
     tmp = tempfile.mkdtemp(prefix="ghostbench-test-")
     try:
         dest = os.path.join(tmp, "project")
-        shutil.copytree(project.path, dest, ignore=shutil.ignore_patterns(
-            ".git", "__pycache__", "node_modules"))
+        skipped_symlinks = _copy_project_safely(project.path, dest)
+        sandbox = _sandbox_block(skipped_symlinks)
         if patch_text:
+            problems = _validate_patch_paths(patch_text, dest)
+            if problems:
+                # Refused BEFORE git apply: containment is Bench's
+                # own verdict, not whatever the local git binary
+                # happens to enforce.
+                return {"ran": False, "status": "patch-apply-failed",
+                        "detail": "patch refused (containment): "
+                                  + "; ".join(problems),
+                        "sandbox": sandbox,
+                        "skipped_symlinks": skipped_symlinks}
             ok, msg = _apply_patch_git(dest, patch_text)
             if not ok:
                 return {"ran": False, "status": "patch-apply-failed",
-                        "detail": msg}
+                        "detail": msg, "sandbox": sandbox,
+                        "skipped_symlinks": skipped_symlinks}
         try:
-            proc = subprocess.run(argv, cwd=dest, capture_output=True,
-                                  text=True, timeout=120)
+            proc = subprocess.run(
+                argv, cwd=dest, capture_output=True, text=True,
+                timeout=120, env=_scrubbed_env(tmp, dest),
+                preexec_fn=(_apply_resource_limits
+                            if resource is not None else None))
             return {"ran": True,
                     "status": "pass" if proc.returncode == 0 else "fail",
                     "exit_code": proc.returncode,
-                    "output_tail": (proc.stdout + proc.stderr)[-1000:]}
+                    "output_tail": (proc.stdout + proc.stderr)[-OUTPUT_TAIL_CHARS:],
+                    "sandbox": sandbox,
+                    "skipped_symlinks": skipped_symlinks}
         except subprocess.TimeoutExpired:
-            return {"ran": True, "status": "timeout", "exit_code": None}
+            return {"ran": True, "status": "timeout", "exit_code": None,
+                    "sandbox": sandbox,
+                    "skipped_symlinks": skipped_symlinks}
         except OSError as exc:
             # Missing binary / not executable: a scored outcome for
             # this task, not a crash that loses the whole run.
             return {"ran": True, "status": "error", "exit_code": None,
-                    "detail": str(exc)}
+                    "detail": str(exc), "sandbox": sandbox,
+                    "skipped_symlinks": skipped_symlinks}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -287,6 +606,8 @@ def run_task(corpus: Corpus, project: Project, task: Task, *,
         if test_result.get("status") not in ("pass",):
             failures.append(f"test command: {test_result.get('status')}")
 
+
+
     if test_result["ran"]:
         status = "pass" if test_result["status"] == "pass" else "fail"
     elif patch is not None:
@@ -309,6 +630,23 @@ def run_task(corpus: Corpus, project: Project, task: Task, *,
         failures.append("no recorded patch and no test result: "
                         "task outcome cannot be scored in Tier A")
 
+    # Evidence contract (verification_level): a row whose tests
+    # actually ran in the contained runner is tests-executed; any
+    # other Tier A row that carries static evidence (tokens
+    # measured, a recorded patch scored, Verify/symbol signals) is
+    # static-analysis - even when the task outcome itself stays
+    # "unknown", because the static measurement did happen. A row
+    # over an empty/unreadable project measured nothing at all and
+    # is none. Tier A never produces live-agent rows, and no row is
+    # ever labelled above the evidence that backs it.
+    if test_result.get("ran"):
+        verification_level = "tests-executed"
+    elif patch is not None or hard_gaps or missing_slice_symbols \
+            or full_tokens > 0:
+        verification_level = "static-analysis"
+    else:
+        verification_level = "none"
+
     return {
         "project": project.id, "task": task.id, "prompt": task.prompt,
         "project_commit": project.commit,
@@ -324,6 +662,7 @@ def run_task(corpus: Corpus, project: Project, task: Task, *,
         "symbols_score": symbols_score,
         "test": test_result,
         "status": status,
+        "verification_level": verification_level,
         "failures": failures,
         "flaky": False,
     }
@@ -394,9 +733,41 @@ def run_corpus(corpus: Corpus, *, suite: str = "slice",
         {"corpus": corpus.name, "version": corpus.version, "rows": rows},
         sort_keys=True, default=str).encode()).hexdigest()[:12]
     subset = (sorted(task_filter) if task_filter else None)
+    # Report-level verification level = strongest level among rows.
+    report_level = strongest_verification_level(
+        r["verification_level"] for r in rows)
+    # The report-level sandbox block describes the contained runner
+    # whenever any row's tests ran (every executed row carries the
+    # same enforced/not_enforced lists); the per-row blocks remain
+    # authoritative for skipped_symlinks.
+    report_sandbox = None
+    for r in rows:
+        block = (r.get("test") or {}).get("sandbox")
+        if block:
+            report_sandbox = {"enforced": block["enforced"],
+                              "not_enforced": block["not_enforced"]}
+            break
+    not_measured = [
+        "live agent task completion (Tier B, opt-in, not run)",
+        "answer quality (no LLM judge in v0.1)",
+    ]
+    if report_level == "tests-executed":
+        tier_scope = ("A (tests executed in the contained runner; "
+                      "no model, no spend)")
+    elif report_level == "static-analysis":
+        tier_scope = "A (static, no model, no spend)"
+    else:
+        tier_scope = "A (no task measured; no model, no spend)"
+    if not run_tests:
+        not_measured.append(
+            "task test commands (not run; pass run_tests to execute "
+            "them in the contained runner)")
     return {
         "tool": "ghostbench", "tool_version": __version__,
         "tier": "A", "suite": suite,
+        "verification_level": report_level,
+        "provenance": "live",
+        "sandbox": report_sandbox,
         "run_id": f"{now.strftime('%Y%m%dT%H%M%SZ')}-{fingerprint}",
         "created_utc": now.isoformat(),
         "corpus": {"name": corpus.name, "version": corpus.version,
@@ -413,12 +784,9 @@ def run_corpus(corpus: Corpus, *, suite: str = "slice",
                       "table, never billed amounts."),
         "run_tests": run_tests,
         "honest_scope": {
-            "tier": "A (static, no model, no spend)",
+            "tier": tier_scope,
             "tasks_measured": len(rows),
-            "what_was_not_measured": [
-                "live agent task completion (Tier B, opt-in, not run)",
-                "answer quality (no LLM judge in v0.1)",
-            ],
+            "what_was_not_measured": not_measured,
         },
         "totals": totals,
         "tasks": rows,
@@ -439,6 +807,7 @@ def append_ledger(report: dict, ledger_path: str) -> str:
     record = {
         "ts": report["created_utc"], "run_id": report["run_id"],
         "tool_version": report["tool_version"], "tier": report["tier"],
+        "verification_level": report.get("verification_level"),
         "estimator_version": report["estimator_version"],
         "corpus": report["corpus"]["name"],
         "corpus_version": report["corpus"]["version"],
