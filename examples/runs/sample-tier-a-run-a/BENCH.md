@@ -1,0 +1,42 @@
+# GhostBench Report - adversarial
+
+> SAMPLE format example only, in the shape written by the core report
+> writer. Numbers are illustrative and were NOT produced by a bench
+> run. Do not quote as results.
+
+- Run: SAMPLE-run-a
+- Tier: A | Suite: slice
+- Tool: ghostbench 0.1.0
+- Corpus: adversarial v0.1.0
+- GhostSlice version: sample
+- Estimator: sample-estimator-1 (source: sample)
+- Price table date: sample (estimates only, never billed amounts)
+- Tests run: False
+
+## Honest scope
+
+- Measured: A (static, no model, no spend), 2 task(s).
+- Not measured: live agent task completion (Tier B, opt-in, not run)
+- Not measured: answer quality (no LLM judge in v0.1)
+
+## Totals
+
+- Full tokens (estimated): 8400
+- sliced: 2000 tokens, saving vs full: 76.2%, fit success rate: 100.0%
+- Tasks: 2 (pass 1, fail 1, unknown 0)
+- Hard gaps predicted (Verify): 1
+
+## Per-task results
+
+| Project | Task | Status | Full | Sliced | Saving % | Hard gaps | Patch files | Manifest (sliced) |
+|---|---|---|---:|---:|---:|---:|---|---|
+| adversarial | adv-001-fix-missing-route | pass | 4200 | 1000 | 76.2 | 0 | shop/helpers.py | sha256:21198084e68cf1118905c699c3b0a819b59029d4f026ed5f4b8d1eba5afc1dac |
+| adversarial | adv-002-broken-patch-missing-symbol | fail | 4200 | 1000 | 76.2 | 1 | shop/helpers.py | sha256:21198084e68cf1118905c699c3b0a819b59029d4f026ed5f4b8d1eba5afc1dac |
+
+## Failures (all shown)
+
+- adversarial/adv-002-broken-patch-missing-symbol: verify predicted 1 hard gap(s)
+
+## Traceability
+
+- Every token number comes from the estimator stamped above or from a bundle manifest whose sha256 is in bench-report.json for the same run.
