@@ -394,3 +394,30 @@ def test_bench_md_sample_banner_is_the_first_line():
 def test_bench_md_per_task_table_shows_row_level():
     md = render_bench_md(_report_dict())
     assert "| p | t1 | pass | static-analysis |" in md
+
+
+def test_user_site_packages_stay_importable(tmp_path, monkeypatch):
+    """Regression (Oct 18, 2026 dogfood): with HOME redirected into the
+    temp area, Python loses the user site-packages and a real test
+    command fails with 'No module named pytest' for an environment
+    reason. PYTHONUSERBASE must flow through the scrubbed env."""
+    import site
+
+    base = tmp_path / "userbase"
+    pkg_dir = (base / "lib" /
+               f"python{sys.version_info.major}.{sys.version_info.minor}" /
+               "site-packages" / "ghostprobe")
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("VALUE = 'probe-ok'\n")
+    monkeypatch.setattr(site, "getuserbase", lambda: str(base))
+
+    env = _scrubbed_env(str(tmp_path), str(tmp_path))
+    assert env.get("PYTHONUSERBASE") == str(base)
+
+    project = _project(tmp_path, {"a.py": "x = 1\n"})
+    result = _run_test_in_temp(
+        project, Task(id="t", test_command=(
+            "python3 -c \"import ghostprobe; "
+            "print(ghostprobe.VALUE)\"")), None)
+    assert result["status"] == "pass"
+    assert "probe-ok" in result["output_tail"]

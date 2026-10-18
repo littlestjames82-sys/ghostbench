@@ -20,7 +20,9 @@ cd ghostbench
 PYTHONPATH=src python3 -m pytest tests -q -rs
 ```
 
-- Result: **92 passed, 1 skipped** (3.81s)
+- Result: **93 passed, 1 skipped** (2.81s; count updated later on
+  Oct 18, 2026 after the PYTHONUSERBASE fix below landed and this
+  exact command was re-run)
 
 The one skip, stated by the test itself
 (`tests/test_budget_gate.py:75`): the mid-corpus budget-cap stop in
@@ -39,6 +41,23 @@ through a patch-created symlink) is refused before `git apply`; a
 project symlink to an outside file is skipped and recorded, never
 followed. Parent re-verification on Oct 18, 2026 reproduced the
 secret probe independently of the suite: output `SECRET_IS: ABSENT`.
+
+## Fix recorded Oct 18, 2026 (dogfood finding)
+
+The first ghostworkflow dogfood run executed this suite inside
+Bench's contained runner and the test process died with
+`No module named pytest`: the scrubbed environment redirects HOME
+into the temp area, which also hides the user site-packages where
+test tooling lives. The runner now passes `PYTHONUSERBASE` (the
+parent's user base, a code location, not a secret) through the
+scrub, pinned by the regression test
+`test_user_site_packages_stay_importable`. After the fix, the same
+contained run executes the full suite: 92 passed, 1 skipped, and 1
+failure that is environmental by construction
+(`test_ghostbus_corpus_points_at_the_real_tree_and_copies_nothing`
+resolves a relative path from the project's real location, which a
+temp copy is not). At the real location that test passes, as the
+93-passed run above shows.
 
 ## Known limits of this run
 

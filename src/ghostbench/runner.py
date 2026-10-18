@@ -155,7 +155,8 @@ TEST_ADDRESS_SPACE_BYTES = 2 * 1024 * 1024 * 1024
 
 SANDBOX_ENFORCED = [
     "environment scrubbed to an allowlist (PATH, LANG/LC_*, TMPDIR "
-    "and HOME inside the temp area); parent-process secrets never "
+    "and HOME inside the temp area, PYTHONUSERBASE naming the "
+    "user's own installed packages); parent-process secrets never "
     "reach the test process",
     "patch paths validated before git apply: '../', absolute, and "
     "symlink-escaping paths are refused, not applied",
@@ -214,6 +215,20 @@ def _scrubbed_env(tmp: str, dest: str) -> dict:
         if value:
             env[key] = value
     env["HOME"] = dest
+    # With HOME redirected into the temp area, Python would lose the
+    # user site-packages, where the project's test tooling (pytest)
+    # normally lives, and every real test command would fail for an
+    # environment reason rather than a code reason. PYTHONUSERBASE
+    # names a code location, not a secret: pass the parent's user
+    # base through so installed packages stay importable.
+    try:
+        import site
+
+        user_base = site.getuserbase()
+    except Exception:
+        user_base = None
+    if user_base and os.path.isdir(user_base):
+        env["PYTHONUSERBASE"] = user_base
     env["TMPDIR"] = tmp
     env["TEMP"] = tmp
     env["TMP"] = tmp
