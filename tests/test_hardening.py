@@ -21,7 +21,7 @@ from ghostbench.prices import estimate_input_cost_usd, load_price_table  # noqa:
 from ghostbench.runner import _run_test_in_temp, read_ledger, run_task  # noqa: E402
 from ghostbench.scoring import (manifest_tokens, normalise_verify_report,  # noqa: E402
                                 parse_patch, saving_pct)
-from ghostbench.tierb import TierBRefusal, check_budget, run_live  # noqa: E402
+from ghostbench.tierb import TierBRefusal, check_budget, run_live_corpus  # noqa: E402
 
 
 def _write_corpus(tmp_path, task_overrides=None, tasks_marker=None):
@@ -43,28 +43,39 @@ def _write_corpus(tmp_path, task_overrides=None, tasks_marker=None):
 # --- Tier B gates -------------------------------------------------
 
 @requires_core
-def test_injected_executor_cannot_bypass_the_env_gate(tmp_path, monkeypatch):
-    """Gate order is budget -> confirm -> GHOSTBENCH_ENABLE_LIVE=1 ->
-    executor. Previously an injected executor ran (and could spend)
-    with the env gate OFF because the check was `executor is None
-    and env != '1'`."""
-    monkeypatch.delenv("GHOSTBENCH_ENABLE_LIVE", raising=False)
+def test_live_run_refuses_without_a_configured_agent(tmp_path, monkeypatch):
+    """The v0.1 bypass this section used to pin - an injected executor
+    running while GHOSTBENCH_ENABLE_LIVE was off - has no analogue in
+    the live-agent design: there is no executor injection and no
+    enable switch. The agent command comes only from an explicit
+    caller argument or GHOSTBENCH_AGENT_CMD; with neither present,
+    run_live_corpus refuses before any task runs."""
+    monkeypatch.delenv("GHOSTBENCH_AGENT_CMD", raising=False)
     corpus_dir = copy_corpus(FIXTURES / "mini", tmp_path / "mini")
     corpus = load_corpus(corpus_dir / "corpus.json")
-    calls = []
-    with pytest.raises(TierBRefusal, match="gated OFF"):
-        run_live(corpus, budget_tokens=10 ** 9, confirm=True,
-                 executor=lambda pre: calls.append(pre))
-    assert calls == [], "executor ran while the live gate was off"
+    with pytest.raises(TierBRefusal, match="GHOSTBENCH_AGENT_CMD"):
+        run_live_corpus(corpus)
+    with pytest.raises(TierBRefusal):
+        run_live_corpus(corpus, agent_cmd="   ")
 
 
 @requires_core
-def test_injected_executor_runs_only_with_env_gate_on(tmp_path, monkeypatch):
-    monkeypatch.setenv("GHOSTBENCH_ENABLE_LIVE", "1")
+def test_live_run_uses_the_configured_env_command(tmp_path, monkeypatch):
+    """With GHOSTBENCH_AGENT_CMD set to a harmless stand-in, the run
+    proceeds at live-agent level and records only the command's
+    first token - never the full line, which may carry secrets in
+    its arguments."""
     corpus_dir = copy_corpus(FIXTURES / "mini", tmp_path / "mini")
     corpus = load_corpus(corpus_dir / "corpus.json")
-    assert run_live(corpus, budget_tokens=10 ** 9, confirm=True,
-                    executor=lambda pre: {"ran": True}) == {"ran": True}
+    monkeypatch.setenv("GHOSTBENCH_AGENT_CMD",
+                       f"{sys.executable} -c pass --key NOT-RECORDED")
+    report = run_live_corpus(corpus)
+    assert report["tier"] == "B"
+    assert report["verification_level"] == "live-agent"
+    assert report["agent"]["name"] == sys.executable
+    assert "NOT-RECORDED" not in json.dumps(report)
+    assert all(r["verification_level"] == "live-agent"
+               for r in report["tasks"])
 
 
 def test_check_budget_rejects_bool_cap_and_negative_use():

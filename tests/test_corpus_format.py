@@ -69,6 +69,14 @@ def test_ghostbus_corpus_points_at_the_real_tree_and_copies_nothing():
     data = load_json(path)
     project = data["projects"][0]
     resolved = (path.parent / project["path"]).resolve()
+    if not resolved.is_dir():
+        # The corpus deliberately points at the real GhostBus tree
+        # outside this repo (../../../../ghostbus). A standalone
+        # checkout does not have it; CI's integration job provides
+        # the sibling. Skip, never fake the tree.
+        import pytest
+        pytest.skip("GhostBus sibling tree not present "
+                    "(integration-only assertion)")
     assert resolved.is_dir(), "GhostBus corpus path does not resolve to a real tree"
     assert (resolved / "src" / "tools.mjs").exists()
     # Reference GhostSlice totals for the tree live in the description,

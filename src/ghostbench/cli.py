@@ -13,12 +13,15 @@ Commands:
       Each argument may be a bench-report.json file or a run folder.
   ghostbench add <corpus> --project PATH --id ID [--name NAME]
       Record a project in a corpus file by tree hash. Copies no code.
-  ghostbench live <corpus> --agent claude-code --budget N
-                          [--model ID] [--task ID ...] [--confirm]
-      Tier B live run, gated OFF by default: a positive --budget cap
-      and --confirm are required, GHOSTBENCH_ENABLE_LIVE=1 must be
-      set, and the v0.1 core wires no executor, so a fully gated run
-      is still refused with nothing spent. See ghostbench.tierb.
+  ghostbench live <corpus> [--out DIR] [--task ID ...]
+                          [--agent-timeout SECONDS] [--ledger PATH]
+                          [--no-ledger] [--strict]
+      Tier B live run: for each task, the agent command configured
+      in the GHOSTBENCH_AGENT_CMD environment variable attempts the
+      task in a contained copy, then the task's tests run in the
+      same copy. Reports carry verification_level "live-agent".
+      With no agent configured, live refuses before anything runs.
+      See ghostbench.tierb.
   ghostbench demo-corpus <dir>
       Write the starter adversarial demo corpus into <dir>.
   ghostbench version
@@ -41,7 +44,8 @@ from .demo import make_demo_corpus
 from .report import (compare_reports, render_compare_md,
                      write_bench_md, write_json_report)
 from .runner import append_ledger, run_corpus
-from .tierb import TierBRefusal, preflight, run_live
+from .tierb import (AGENT_CMD_ENV, TierBRefusal, agent_argv_from_env,
+                    run_live_corpus)
 
 
 def _cmd_run(args) -> int:
@@ -154,34 +158,52 @@ def _cmd_add(args) -> int:
 
 
 def _cmd_live(args) -> int:
-    """Handle ``ghostbench live``: print the Tier B preflight, then enforce the gates."""
+    """Handle ``ghostbench live``: Tier B live-agent run.
+
+    The agent command comes ONLY from GHOSTBENCH_AGENT_CMD and is
+    resolved before the corpus is even loaded: with no agent
+    configured, the run refuses before anything runs and nothing is
+    written.
+    """
+    try:
+        agent_argv = agent_argv_from_env()
+    except TierBRefusal as exc:
+        print(f"Tier B refused: {exc}", file=sys.stderr)
+        return 2
     corpus = load_corpus(args.corpus)
     task_filter = set(args.task) if args.task else None
     try:
-        pre = preflight(corpus, agent=args.agent,
-                        budget_tokens=args.budget, model=args.model,
-                        task_filter=task_filter)
+        report = run_live_corpus(corpus, agent_argv=agent_argv,
+                                 agent_timeout=args.agent_timeout,
+                                 task_filter=task_filter)
     except TierBRefusal as exc:
         print(f"Tier B refused: {exc}", file=sys.stderr)
         return 2
-    print("Tier B preflight (estimates only, not billed amounts):")
-    print(f"  agent={pre['agent']} model={pre['model']} "
-          f"price_table_date={pre['price_table_date']}")
-    for row in pre["tasks"]:
-        print(f"  {row['project']}/{row['task']}: "
-              f"full~{row['full_context_tokens_estimated']} tokens, "
-              f"est input ${row['estimated_input_cost_usd']}")
-    print(f"  estimated total both arms: "
-          f"{pre['estimated_total_tokens_both_arms']} tokens; "
-          f"budget cap: {pre['budget_tokens']}")
-    try:
-        run_live(corpus, agent=args.agent, budget_tokens=args.budget,
-                 model=args.model, confirm=args.confirm,
-                 task_filter=task_filter)
-    except TierBRefusal as exc:
-        print(f"Tier B refused: {exc}", file=sys.stderr)
+    if not report["tasks"]:
+        print("error: run matched no tasks "
+              "(check the --task filter); no report written",
+              file=sys.stderr)
         return 2
-    return 0
+    out_dir = args.out or os.path.join(corpus.base_dir, "runs",
+                                       report["run_id"])
+    write_json_report(report, os.path.join(out_dir, "bench-report.json"))
+    write_bench_md(report, os.path.join(out_dir, "BENCH.md"))
+    ledger_path = None
+    if not args.no_ledger:
+        ledger_path = args.ledger or os.path.join(
+            corpus.base_dir, ".ghostbench-history.jsonl")
+        append_ledger(report, ledger_path)
+    t = report["totals"]
+    print(f"Tier B live run: agent={report['agent']['name']} "
+          f"(command from {AGENT_CMD_ENV}; only the first token is "
+          "recorded)")
+    print(f"run {report['run_id']}: tasks={t['tasks']} "
+          f"pass={t['pass']} fail={t['fail']} unknown={t['unknown']} "
+          f"verification_level={report['verification_level']}")
+    print(f"wrote {out_dir}/BENCH.md and bench-report.json")
+    if ledger_path:
+        print(f"ledger appended: {ledger_path}")
+    return 1 if t["fail"] and args.strict else 0
 
 
 def _cmd_demo(args) -> int:
@@ -199,7 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Proof harness for GhostSlice: same tasks, same "
                     "projects, full vs sliced context, scored the same "
                     "way every time. Tier A is static by default; "
-                    "Tier B live is opt-in and budget-gated.",
+                    "Tier B live runs only an agent command the user "
+                    "configures in GHOSTBENCH_AGENT_CMD.",
         epilog="Examples:\n"
                "  ghostbench run examples/corpora/adversarial/corpus.json "
                "--out /tmp/bench-adv\n"
@@ -271,28 +294,63 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.set_defaults(func=_cmd_add)
 
     p_live = sub.add_parser(
-        "live", help="Tier B live run (gated OFF by default)",
-        description="Tier B live run. Refused unless a positive --budget "
-                    "cap is given, --confirm is passed after the printed "
-                    "preflight, and GHOSTBENCH_ENABLE_LIVE=1 is set. The "
-                    "v0.1 core wires no executor, so even a fully gated "
-                    "run is refused with nothing spent.",
-        epilog="Example (prints the preflight, then refuses in v0.1):\n"
-               "  ghostbench live corpus.json --agent claude-code "
-               "--budget 20000 --confirm")
+        "live", help="Tier B live run (agent from GHOSTBENCH_AGENT_CMD)",
+        description="Tier B live run. For each task, an agent command "
+                    "attempts the task in a contained copy of the "
+                    "project, Bench measures the files it changed, and "
+                    "the task's test command then runs in the same "
+                    "copy. Reports carry verification_level "
+                    "\"live-agent\" on the report and every row.\n\n"
+                    "The agent command comes ONLY from the environment "
+                    "variable GHOSTBENCH_AGENT_CMD (a shell-style "
+                    "command line, split with shlex and executed "
+                    "directly - no shell, so pipes/redirection in "
+                    "the command do not work). Bench hardcodes no "
+                    "vendor and has no default agent: if "
+                    "GHOSTBENCH_AGENT_CMD is unset or empty, live "
+                    "refuses before anything runs and writes nothing. "
+                    "Only the command's first token is recorded in "
+                    "reports (a command line may carry keys in its "
+                    "arguments).\n\n"
+                    "Per task the agent runs with the task copy as "
+                    "its working directory and receives:\n"
+                    "  GHOSTBENCH_TASK_DIR    - path of the task copy\n"
+                    "  GHOSTBENCH_TASK_ID     - the task id\n"
+                    "  GHOSTBENCH_TASK_PROMPT - the task prompt\n"
+                    "and the task copy path appended as the final "
+                    "command argument. Its environment is the "
+                    "contained runner's scrubbed allowlist plus "
+                    "those three variables: parent-process secrets "
+                    "never reach it.\n\n"
+                    "Containment honesty: the agent runs with your "
+                    "permissions outside an OS sandbox. Its working "
+                    "directory is the task copy and Bench directs "
+                    "its work there, but host writes elsewhere are "
+                    "NOT prevented, and network access is NOT "
+                    "blocked. POSIX rlimits and the timeout are "
+                    "best-effort. Every report's sandbox block states "
+                    "exactly this.",
+        epilog="Example:\n"
+               "  GHOSTBENCH_AGENT_CMD='my-agent --non-interactive' "
+               "ghostbench live corpus.json --out /tmp/live-1")
     p_live.add_argument("corpus", help="path to the corpus JSON file")
-    p_live.add_argument("--agent", default="claude-code",
-                        help="agent to run (v0.1: claude-code only; "
-                             "default: claude-code)")
-    p_live.add_argument("--budget", type=int, metavar="TOKENS",
-                        help="hard token budget cap (required)")
-    p_live.add_argument("--model", default="claude-sonnet", metavar="ID",
-                        help="model id for the preflight cost estimate "
-                             "(default: claude-sonnet)")
+    p_live.add_argument("--out", metavar="DIR",
+                        help="output folder for BENCH.md and "
+                             "bench-report.json (default: "
+                             "<corpus-dir>/runs/<run-id>)")
     p_live.add_argument("--task", action="append", metavar="ID",
-                        help="only this task id (repeatable)")
-    p_live.add_argument("--confirm", action="store_true",
-                        help="explicit confirmation after preflight")
+                        help="only this task id (repeatable); run is labelled a subset")
+    p_live.add_argument("--agent-timeout", type=int, metavar="SECONDS",
+                        default=300,
+                        help="wall-clock timeout for each task's agent "
+                             "attempt (default: 300)")
+    p_live.add_argument("--ledger", metavar="PATH",
+                        help="history ledger file to append to (default: "
+                             ".ghostbench-history.jsonl next to the corpus)")
+    p_live.add_argument("--no-ledger", action="store_true",
+                        help="do not append this run to the history ledger")
+    p_live.add_argument("--strict", action="store_true",
+                        help="exit 1 when any task fails")
     p_live.set_defaults(func=_cmd_live)
 
     p_demo = sub.add_parser(

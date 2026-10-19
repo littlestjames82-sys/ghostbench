@@ -239,17 +239,17 @@ def _scrubbed_env(tmp: str, dest: str) -> dict:
     return env
 
 
-def _apply_resource_limits() -> None:
-    """preexec_fn for the test process: POSIX rlimits, best-effort.
+def _set_resource_limits(cpu_seconds: int) -> None:
+    """Apply the contained-runner POSIX rlimits in the child process.
 
-    Runs in the child after fork, before exec. Any limit the OS
-    refuses is skipped silently - the wall-clock timeout and the
-    report's not_enforced list cover the gap honestly.
+    Runs after fork, before exec (as a preexec_fn body). Any limit
+    the OS refuses is skipped silently - the wall-clock timeout and
+    the report's not_enforced list cover the gap honestly.
     """
     if resource is None:  # pragma: no cover - non-POSIX
         return
     limits = [
-        (resource.RLIMIT_CPU, TEST_CPU_SECONDS),
+        (resource.RLIMIT_CPU, cpu_seconds),
         (resource.RLIMIT_FSIZE, TEST_FILE_SIZE_BYTES),
         (resource.RLIMIT_CORE, 0),
     ]
@@ -263,6 +263,79 @@ def _apply_resource_limits() -> None:
             resource.setrlimit(what, (value, value))
         except (ValueError, OSError):
             continue
+
+
+def _apply_resource_limits() -> None:
+    """preexec_fn for the test process: POSIX rlimits, best-effort."""
+    _set_resource_limits(TEST_CPU_SECONDS)
+
+
+def _preexec_agent_limits(cpu_seconds: int):
+    """preexec_fn for the Tier B agent process, or None off-POSIX.
+
+    Same limit set as the test runner (file size, address space, no
+    core dump); only the CPU allowance differs, scaled to the
+    agent's own wall-clock timeout by the caller.
+    """
+    if resource is None:  # pragma: no cover - non-POSIX
+        return None
+
+    def _apply() -> None:
+        _set_resource_limits(cpu_seconds)
+
+    return _apply
+
+
+# ------------------------------------------------------------------
+# Tier B live-agent containment statement (evidence contract)
+#
+# A live run executes a user-configured agent command inside the
+# same contained copy discipline as the test runner above: safe
+# copy, scrubbed environment, rlimits, timeout. The agent is a real
+# program the user chose to run, though - not a patch Bench
+# validated - so the enforced / not-enforced split differs from
+# Tier A's and every live row states it in its own sandbox block.
+# ------------------------------------------------------------------
+
+LIVE_SANDBOX_ENFORCED = [
+    "project copied to a fresh temp directory; the agent process "
+    "runs with that copy as its working directory; symlinks whose "
+    "targets resolve outside the project are skipped and recorded, "
+    "never followed",
+    "environment scrubbed to the same allowlist as the contained "
+    "test runner (PATH, LANG/LC_*, TMPDIR and HOME inside the temp "
+    "area, PYTHONUSERBASE naming the user's own installed "
+    "packages); parent-process secrets never reach the agent "
+    "process; the only additions are GHOSTBENCH_TASK_DIR, "
+    "GHOSTBENCH_TASK_ID and GHOSTBENCH_TASK_PROMPT",
+    "wall-clock timeout on the agent process (configurable via "
+    "--agent-timeout, default 300s) and on the task test process "
+    "(120s, as in Tier A)",
+    "captured agent and test output capped (last 1000 characters "
+    "kept)",
+    "POSIX resource limits where the OS allows: CPU seconds, max "
+    "file size, address space, no core dump",
+]
+
+LIVE_SANDBOX_NOT_ENFORCED = [
+    "host filesystem writes by the agent process are NOT "
+    "prevented: the agent runs with the user's permissions outside "
+    "an OS sandbox; Bench directs its work at the task copy by "
+    "setting the working directory there, but nothing enforces "
+    "that it writes nowhere else",
+    "network access is NOT blocked or monitored: the configured "
+    "agent may use the network; Bench itself makes no network calls",
+    "resource limits are best-effort POSIX rlimits, absent on "
+    "non-POSIX platforms",
+]
+
+
+def _live_sandbox_block(skipped_symlinks) -> dict:
+    """The honest containment statement attached to every live-agent
+    task row. Fresh lists each call, like :func:`_sandbox_block`."""
+    return {"enforced": list(LIVE_SANDBOX_ENFORCED),
+            "not_enforced": list(LIVE_SANDBOX_NOT_ENFORCED),
+            "skipped_symlinks": list(skipped_symlinks)}
 
 
 _DIFF_GIT_RE = re.compile(r"^diff --git (.+?) (.+)$")

@@ -4,6 +4,118 @@ Reproducible record of a full-suite run. Regenerate on every
 release-grade change; counts quoted anywhere else must match this
 file or be removed.
 
+## Run of Oct 18, 2026 (live-agent build)
+
+- Date (UTC): 2026-10-19T02:52Z
+- Platform: Linux 7.0.0-39-generic x86_64
+- Python: 3.12.3
+- pytest: 9.1.1
+- Tree: ghostbench v0.1.0, live-agent build (Tier B report writer:
+  `ghostbench live` runs a configured agent per task and emits
+  `verification_level: "live-agent"` reports)
+- Command:
+
+```sh
+cd ghostbench
+PYTHONPATH=src python3 -m pytest tests -q -rs
+```
+
+- Result: **102 passed, 0 skipped** (5.89s)
+
+This supersedes the evidence-contract run below as the current
+count. The delta is the Tier B redesign, not silent churn: the 5
+old budget-gate tests and the 1 skip pinned a gate model that no
+longer exists (see the design note), and were replaced by 3 new
+gate tests in `tests/test_budget_gate.py`, 2 rewritten gate tests
+in `tests/test_hardening.py`, and 11 new tests in
+`tests/test_live_agent.py`.
+
+### What the live-agent build is
+
+The evidence contract's top level, `live-agent`, was defined in
+v0.1 but nothing could emit it: Tier B was a gate-only stub (one
+hardcoded `--agent claude-code` behind a `--budget` cap, a
+`--confirm` flag, and `GHOSTBENCH_ENABLE_LIVE=1`, with no executor
+wired). That model is replaced:
+
+- The agent command comes ONLY from the environment variable
+  `GHOSTBENCH_AGENT_CMD` (a shell-style command line, split with
+  shlex and executed directly - no shell). Bench hardcodes no
+  vendor, has no default agent, and makes no network calls itself.
+- **Refusal behavior:** with `GHOSTBENCH_AGENT_CMD` unset, empty,
+  or unparseable, `ghostbench live` exits 2 with a plain message
+  naming the variable and how to set it, BEFORE anything runs; no
+  report, run folder, or ledger record is written. The CLI test
+  asserts all three absences.
+- Per task, the agent runs in a contained copy of the project (the
+  Tier A machinery: `_copy_project_safely`, `_scrubbed_env`,
+  POSIX rlimits; escaping symlinks skipped and recorded). It
+  receives the copy path in `GHOSTBENCH_TASK_DIR` and as the final
+  argument, the task id in `GHOSTBENCH_TASK_ID`, and the prompt in
+  `GHOSTBENCH_TASK_PROMPT`. The timeout is `--agent-timeout`
+  (default 300s). Bench then measures the file-level diff against
+  a pristine copy and runs the task's test command in the agent's
+  copy, contained exactly like Tier A.
+- Verdict: a task passes only when the agent produced changes AND
+  the contained tests pass. A crash, a timeout, or no changes is a
+  failed row with the reason shown; a nonzero exit is rescued only
+  by changes that pass the tests (the exit code is recorded either
+  way). A task with no test command scores `unknown`.
+- Hygiene: only the command's first token is recorded as
+  `agent_name`. The full command line - which may carry keys in
+  its arguments - appears nowhere in a report; a test asserts a
+  planted `--key SECRETVALUE` is absent from the whole report JSON,
+  and a planted parent-env secret is absent from the environment
+  an agent process actually receives (the Tier A probe pattern,
+  applied to the agent's env dump).
+- Honest scope, extended for live runs: the agent runs with the
+  user's permissions outside an OS sandbox. Bench directs its
+  work at the task copy by making that copy its working directory,
+  but host writes elsewhere are NOT prevented and network access
+  is NOT blocked. Every live row and the report carry the
+  `sandbox` block stating exactly this.
+
+### Proof run (stand-in agent, stated plainly)
+
+**No real vendor agent was run for this build.** No agent is
+configured in this environment (`GHOSTBENCH_AGENT_CMD` unset), so
+the mechanism was proven end-to-end through the real CLI with a
+scripted stand-in agent; the level semantics are real, and no
+vendor agent was exercised. Proof, on a temp corpus whose one
+task's test fails before the fix and passes after:
+
+- pristine project test: `AssertionError: add is broken`, exit 1;
+- `ghostbench live` with no agent configured: exit 2, the refusal
+  message above, and no output folder created;
+- `GHOSTBENCH_AGENT_CMD='python3 <stand-in>' ghostbench live
+  corpus.json`: exit 0, `pass=1 fail=0`, report `tier: "B"`,
+  `verification_level: "live-agent"` on the report and the row,
+  `agent_name: "python3"` (first token only),
+  `agent_exit_code: 0`, `agent_timed_out: false`,
+  `files_changed: 1` (`calc.py`), `test: "pass"`;
+- the pristine project's test still fails afterwards - the agent
+  worked in a copy, never in the real tree.
+
+The same behaviours are pinned by `tests/test_live_agent.py`
+(fixing agent passes; do-nothing agent fails on the no-change
+rule even when the tests already pass; crash records exit code 3;
+a 1s timeout against a 60s sleeper records `timed_out`; symlink
+escape skipped and recorded).
+
+### Known limits of this run
+
+- No vendor agent has ever been run under the live path; the first
+  real agent run is still to come, by whoever configures one.
+- The mid-corpus budget-cap stop the old suite skipped is gone
+  with the budget gate itself: the configured agent is the user's
+  own program and its spend happens outside Bench, so Bench has
+  no spend of its own to cap. `tierb.check_budget` remains as a
+  utility for callers wrapping a run with their own accounting,
+  and its unit test still passes.
+- Live containment is application-level, like Tier A's: scrubbed
+  env, contained copy, POSIX rlimits, timeouts. Host writes and
+  network by the agent process are not OS-enforced; reports say so.
+
 ## Run of Oct 18, 2026 (evidence-contract build)
 
 - Date (UTC): 2026-10-18T20:50Z
@@ -67,3 +179,13 @@ temp copy is not). At the real location that test passes, as the
   contained patch/copy, POSIX rlimits, timeout). Host filesystem
   writes and network access by a test process are not OS-enforced;
   every report's `sandbox` block says so.
+
+## Addendum, Oct 18, 2026 (CI)
+
+CI added (GitHub Actions, Python 3.10/3.11/3.12 on push) with two
+jobs, mirroring GhostVerify: a standalone job (the GhostBus corpus
+test skips there, since the example corpus deliberately points at
+the real GhostBus tree outside this repo) and an integration job
+that checks out GhostBus at the workspace root so the corpus path
+resolves and the test runs for real. Local counts: dev tree 102
+passed; standalone simulation 101 passed + 1 skipped.

@@ -1,81 +1,62 @@
-"""Tier B budget gate tests. PLAN.md hard rule: Bench never spends
-silently. The core's gate order (src/ghostbench/tierb.py) is:
-(1) a positive --budget cap is required, (2) explicit confirmation via
---confirm is required after the preflight is printed, (3) live
-execution must be enabled with GHOSTBENCH_ENABLE_LIVE=1, and (4) the
-v0.1 core wires no executor at all, so even a capped, confirmed run
-is refused with 'nothing was spent'.
+"""Tier B live gate tests. PLAN.md hard rule: Bench never spends
+silently - and, since the live-agent build (Oct 18, 2026), never
+runs an agent it was not configured to run.
 
-These tests exercise refusal paths only. The one test that passes
---confirm also removes GHOSTBENCH_ENABLE_LIVE from the environment,
-so gate (3) refuses before any executor could ever be reached.
+The v0.1 gate model this file used to pin (a positive --budget cap,
+--confirm after a printed preflight, GHOSTBENCH_ENABLE_LIVE=1, one
+hardcoded --agent, and no executor wired at all) was REPLACED by
+the live-agent design: the agent command comes only from
+GHOSTBENCH_AGENT_CMD, Bench hardcodes no vendor and has no default
+agent, and the gate is a single refusal - with no agent configured,
+`ghostbench live` exits 2 before anything runs and writes nothing.
+Whatever the configured agent spends happens inside the user's own
+program, outside Bench; Bench itself calls no model and no network.
+
+These tests pin that refusal at the CLI level. The behaviour of a
+configured run (with fake agents only) is pinned in
+tests/test_live_agent.py.
 """
-
-import pytest
 
 from conftest import FIXTURES, requires_core, run_cli, copy_corpus
 
 MINI = "corpus.json"
 
 
-def _live(tmp_path, *extra, env_remove=()):
+@requires_core
+def test_live_refuses_without_an_agent_command(tmp_path):
     corpus_dir = copy_corpus(FIXTURES / "mini", tmp_path / "mini")
-    return run_cli(
-        ["live", corpus_dir / MINI, "--agent", "claude-code", *extra],
-        stdin="",
-        env_remove=env_remove,
-    )
-
-
-@requires_core
-def test_live_refuses_without_a_budget_cap(tmp_path):
-    proc = _live(tmp_path)
+    proc = run_cli(["live", corpus_dir / MINI], stdin="",
+                   env_remove=("GHOSTBENCH_AGENT_CMD",))
     combined = (proc.stdout + proc.stderr).lower()
-    assert proc.returncode == 2, "Tier B did not refuse a run with no budget cap"
-    assert "budget" in combined and "refused" in combined
+    assert proc.returncode == 2, "live did not refuse with no agent configured"
+    assert "no agent is configured" in combined
+    assert "ghostbench_agent_cmd" in combined
+    # The refusal happens before anything runs: no run folder, no
+    # report, no ledger record was written anywhere.
+    assert not (corpus_dir / "runs").exists()
+    assert not (corpus_dir / ".ghostbench-history.jsonl").exists()
 
 
 @requires_core
-def test_live_refuses_with_budget_but_no_confirmation(tmp_path):
-    proc = _live(tmp_path, "--budget", "20000")
-    combined = (proc.stdout + proc.stderr).lower()
-    assert proc.returncode == 2, "Tier B did not refuse an unconfirmed run"
-    assert "confirmation is required" in combined
-
-
-@requires_core
-def test_live_preflight_shows_estimate_before_refusing(tmp_path):
-    """The CLI prints the preflight (tasks, model, estimated cost, cap)
-    before the confirmation refusal, so the user refuses informed."""
-    proc = _live(tmp_path, "--budget", "20000")
-    stdout = proc.stdout.lower()
-    assert proc.returncode == 2
-    assert "preflight" in stdout and "estimat" in stdout
-    assert "budget cap: 20000" in stdout
-
-
-@requires_core
-def test_live_confirmed_but_executor_gate_off_still_spends_nothing(tmp_path):
-    proc = _live(tmp_path, "--budget", "20000", "--confirm",
-                 env_remove=("GHOSTBENCH_ENABLE_LIVE",))
-    combined = (proc.stdout + proc.stderr).lower()
-    assert proc.returncode == 2
-    assert "nothing was spent" in combined or "no model was called" in combined
-
-
-@requires_core
-def test_live_rejects_an_unsupported_agent(tmp_path):
+def test_live_refuses_with_an_empty_agent_command(tmp_path):
     corpus_dir = copy_corpus(FIXTURES / "mini", tmp_path / "mini")
-    proc = run_cli(["live", corpus_dir / MINI, "--agent", "some-other-agent",
-                    "--budget", "20000"])
+    proc = run_cli(["live", corpus_dir / MINI], stdin="",
+                   env_extra={"GHOSTBENCH_AGENT_CMD": "   "})
+    combined = (proc.stdout + proc.stderr).lower()
     assert proc.returncode == 2
-    assert "one agent only" in (proc.stdout + proc.stderr).lower()
+    assert "no agent is configured" in combined
+    assert not (corpus_dir / "runs").exists()
 
 
-@pytest.mark.skip(reason="Mid-corpus cap stop (tierb.check_budget in the core) can only "
-                         "be exercised end-to-end with a stub executor injected into "
-                         "run_live, which the CLI does not expose; the CLI-level gate "
-                         "cannot reach it without a live run. Not run under the "
-                         "no-live-runs gate for this build. See REPORT_B.md.")
-def test_live_stops_at_cap_mid_corpus_and_reports_partial():
-    raise NotImplementedError
+@requires_core
+def test_live_help_documents_the_agent_contract(tmp_path):
+    """--help is where the configuration contract lives: the env
+    var, the three task variables, the timeout flag, and the
+    first-token-only recording rule."""
+    proc = run_cli(["live", "--help"])
+    assert proc.returncode == 0
+    text = " ".join(proc.stdout.split())  # unwrap argparse's lines
+    for needle in ("GHOSTBENCH_AGENT_CMD", "GHOSTBENCH_TASK_DIR",
+                   "GHOSTBENCH_TASK_ID", "GHOSTBENCH_TASK_PROMPT",
+                   "--agent-timeout", "first token"):
+        assert needle in text, f"live --help does not document {needle}"

@@ -20,11 +20,13 @@ requires_core = pytest.mark.skipif(
 )
 
 
-def run_cli(args, *, stdin=None, timeout=120, env_remove=()):
+def run_cli(args, *, stdin=None, timeout=120, env_remove=(), env_extra=None):
     """Run the GhostBench CLI as a black box: python -m ghostbench ..."""
     env = dict(os.environ)
     for key in env_remove:
         env.pop(key, None)
+    for key, value in (env_extra or {}).items():
+        env[key] = value
     env["PYTHONPATH"] = str(SRC) + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(
         [sys.executable, "-m", "ghostbench", *[str(a) for a in args]],

@@ -22,9 +22,9 @@ not a number to average.
 
 > Build status: v0.1. The corpus format, report format, and CLI
 > contract in this README describe the shipped core
-> (`src/ghostbench/`). Test results, the Tier B refusal record, and
-> the gaps not yet covered are recorded honestly in `REPORT_B.md`
-> (Agent B) and `IMPLEMENTATION_A.md` (core).
+> (`src/ghostbench/`). Test results are recorded in `RESULTS.md`;
+> the earlier build phases and the gaps they recorded are in
+> `REPORT_B.md` (Agent B) and `IMPLEMENTATION_A.md` (core).
 
 ## Contents
 
@@ -62,31 +62,40 @@ ghostbench version   # smoke check: prints "ghostbench 0.1.0"
 ```
 
 Requires Python 3.10 or newer. There is nothing to configure for
-Tier A: no API key, no account, no network. (Tier B needs no setup
-either in v0.1, because it refuses rather than runs; see The two
-tiers.)
+Tier A: no API key, no account, no network. (Tier B runs only when
+you configure an agent command in `GHOSTBENCH_AGENT_CMD`; see The
+two tiers.)
 
 ## The two tiers
 
 | Tier | What it does | Model? | Spend? | Default |
 |---|---|---|---|---|
 | A | Static bench: bundle sizes, GhostVerify verdicts, recorded-patch checks, fit behaviour | No | No | Yes |
-| B | Live bench: runs one agent (Claude Code in v0.1) on each task, full vs sliced, scores the test command | Yes | Yours, capped | **Off** |
+| B | Live bench: runs the agent command you configure on each task in a contained copy, measures what it changed, then scores the task's test command in the same copy | The agent's | The agent's (Bench spends nothing itself) | **Off** - refuses until configured |
 
 The tiers are kept separate in every report. A Tier A number is never
 presented as a live outcome.
 
-**Tier B hard rule: Bench never spends silently.** The gate order in
-the core is: (1) a positive per-run budget cap (`--budget <tokens>`)
-is required, (2) explicit confirmation (`--confirm`) is required after
-the printed pre-flight, (3) live execution must be enabled with
-`GHOSTBENCH_ENABLE_LIVE=1`, and (4) the v0.1 core wires **no executor
-at all**, so even a capped, confirmed, enabled run is refused with a
-message stating no model was called and nothing was spent. The
-pre-flight prints the tasks, the model, the estimated full-context
-cost per task and both-arms total from the local price table before
-any gate decision. Tier B is never run on a schedule or in CI by
-default; CI gets Tier A.
+**Tier B hard rule: Bench never runs an agent it was not configured
+to run.** The agent is a command line you supply in the environment
+variable `GHOSTBENCH_AGENT_CMD` - Bench hardcodes no vendor, has no
+default agent, and makes no network calls itself. If
+`GHOSTBENCH_AGENT_CMD` is unset or empty, `ghostbench live` refuses
+before anything runs and writes nothing. Per task, the command is
+split shell-style and executed directly (no shell) inside a contained
+copy of the project, with the Tier A containment discipline (safe
+copy, scrubbed environment, POSIX rlimits, timeout); it receives
+the copy path in `GHOSTBENCH_TASK_DIR` and as its final argument,
+the task id in `GHOSTBENCH_TASK_ID`, and the prompt in
+`GHOSTBENCH_TASK_PROMPT`. Only the command's **first token** is
+recorded in reports - a command line may carry keys in its
+arguments, so the full line is never written down. The containment
+is honest, not total: the agent runs with your permissions outside
+an OS sandbox, so host writes outside the task copy are directed
+there by the working directory but **not prevented**, and network
+access is **not blocked**; every live report's `sandbox` block
+states this. Tier B is never run on a schedule or in CI by default;
+CI gets Tier A.
 
 ## Quickstart
 
@@ -146,9 +155,10 @@ ghostbench add my-corpus.json --project ~/my-project --id my-project
 ghostbench demo-corpus /tmp/ghostbench-demo
 ghostbench run /tmp/ghostbench-demo/corpus.json --out /tmp/bench-demo
 
-# Tier B, opt-in only: refuses without --budget, refuses without --confirm,
-# and in v0.1 refuses even then because no executor is wired (nothing is spent)
-ghostbench live examples/corpora/adversarial/corpus.json --agent claude-code --budget 20000
+# Tier B, opt-in only: runs the agent command YOU configure, per task,
+# in a contained copy. Without one configured it refuses, writes nothing.
+GHOSTBENCH_AGENT_CMD='my-agent --non-interactive' \
+  ghostbench live examples/corpora/adversarial/corpus.json --out /tmp/bench-live
 ```
 
 Run `ghostbench --help` or `ghostbench <command> --help` at any
@@ -256,8 +266,18 @@ sha256 is in the same run's `bench-report.json`. Token counts are
 formula-compatible fallback, named in `estimator_source`), and costs
 come from a local dated price table. Estimates are labelled as
 estimates in every report, never presented as billed amounts.
-Tier B provider-reported tokens, when a future executor records
-them, are labelled *reported* and kept separate.
+
+Tier B reports carry the same shape, with `tier: "B"`, an `agent`
+header block (the recorded first token, the timeout, and the
+command source), and per-row live fields: `agent_name`,
+`agent_exit_code`, `agent_timed_out`, `agent_output_tail`,
+`files_changed` with `files_changed_paths` / `files_added` /
+`files_deleted` / `files_modified`, a `sandbox` block stating the
+live containment honestly, and the contained `test` outcome against
+the agent's edits. `verification_level` is `live-agent` on the
+report and every row. Bench records no agent token usage in Tier B:
+the configured agent reports none to Bench, and none is estimated
+or blended in.
 
 The sliced arm, when a task supplies no bundle, is derived from the
 task's `expected_files` and labelled in the row as
@@ -274,7 +294,7 @@ and they must never be quoted as bench results.
 | Command | What it does |
 |---|---|
 | `ghostbench run <corpus.json> [--suite slice\|verify\|recall\|proxy] [--out <dir>] [--task <id> ...] [--run-tests] [--model <id>] [--ledger <path>] [--no-ledger] [--strict]` | Tier A run. `--run-tests` is opt-in and runs task test commands in a temp copy only. `--strict` exits 1 when any task fails |
-| `ghostbench live <corpus.json> --agent claude-code --budget <tokens> [--confirm] [--model <id>] [--task <id> ...]` | Tier B. Gate order: positive budget required, explicit `--confirm` required after the printed preflight, `GHOSTBENCH_ENABLE_LIVE=1` required, and the v0.1 core wires no executor, so a fully gated run is still refused with nothing spent |
+| `ghostbench live <corpus.json> [--out <dir>] [--task <id> ...] [--agent-timeout <seconds>] [--ledger <path>] [--no-ledger] [--strict]` | Tier B live run. The agent command comes only from `GHOSTBENCH_AGENT_CMD`; without one configured, live refuses before anything runs. Per task the agent attempts the task in a contained copy (receiving `GHOSTBENCH_TASK_DIR` / `GHOSTBENCH_TASK_ID` / `GHOSTBENCH_TASK_PROMPT` and the copy path as final argument), Bench measures the changed files, and the task's tests run in the same copy. `--agent-timeout` defaults to 300s; `--strict` exits 1 when any task fails |
 | `ghostbench compare <run-a.json> <run-b.json> [--out <file>]` | Per-task token and status deltas (B - A). `.json` out writes the compare object, anything else writes Markdown. Warns when estimator versions differ |
 | `ghostbench add <corpus.json> --project <path> --id <id> [--name <name>]` | Record a project in a corpus file by tree hash |
 | `ghostbench demo-corpus <dir>` | Write the core's starter adversarial corpus into a directory you choose |
@@ -305,8 +325,8 @@ and they must never be quoted as bench results.
 | Code | Meaning |
 |---|---|
 | 0 | Success. For `run`, also: no `--strict` failure. |
-| 1 | `run --strict` only: at least one task failed. The report is still written. |
-| 2 | Usage error, corpus error (missing file, invalid JSON, duplicate id, missing project path, non-positive budget), or a Tier B refusal. For Tier B, the refusal message states that no model was called and nothing was spent. |
+| 1 | `run --strict` / `live --strict` only: at least one task failed. The report is still written. |
+| 2 | Usage error, corpus error (missing file, invalid JSON, duplicate id, missing project path, non-positive budget), or a Tier B refusal. For Tier B, the refusal message states that no agent is configured and that nothing was run. |
 
 Running with no subcommand prints the help text and exits 2.
 
@@ -329,9 +349,10 @@ Running with no subcommand prints the help text and exits 2.
   re-run with `--run-tests` and a task `test_command`.
 - **The adversarial run shows failures** - that is the designed
   outcome, not a broken install. See Quickstart step 1.
-- **`Tier B refused: ...`** - a gate did its job. Read the message:
-  it names the missing cap, confirmation, or enable flag. In v0.1
-  the final gate always refuses because no executor is wired.
+- **`Tier B refused: ...`** - no agent is configured, or the
+  configured command could not be parsed. Read the message: it
+  names `GHOSTBENCH_AGENT_CMD` and shows how to set it. Nothing ran
+  and nothing was written.
 - **Compare warns that estimator versions differ** - the two runs
   were measured with different estimators, so their totals are not
   directly comparable. Re-run one side so both reports carry the
@@ -339,9 +360,15 @@ Running with no subcommand prints the help text and exits 2.
 
 ## Scoring (deliberately boring)
 
-- Task success = the task's test command passes (Tier B, in a temp copy
-  only), or the recorded-patch check outcome for Tier A. **No LLM judge
-  in v0.1.**
+- Task success: in Tier A, the recorded-patch check outcome (or the
+  test outcome under `--run-tests`). In Tier B, the agent must
+  produce changes in the task copy **and** the task's test command
+  must pass against those changes in the same copy: a crash, a
+  timeout, or no changes at all is a failed row with the reason
+  shown, and a task with no test command scores `unknown` because
+  nothing verified the agent's work. A nonzero agent exit is rescued
+  only by changes that pass the tests; the exit code is recorded on
+  the row either way. **No LLM judge in v0.1.**
 - Files-touched is informational only. Extra files are not
   auto-failures; real fixes touch unexpected files.
 - Expected symbols are checked lexically (whole-word, full dotted
@@ -367,8 +394,11 @@ Running with no subcommand prints the help text and exits 2.
   and estimator versions, which the report states.
 - The adversarial corpus produces at least one visible failure or hard
   gap in the first published report.
-- Tier B refuses to start without a cap and a confirmation, and stops
-  at the cap mid-corpus, reporting partial results as partial.
+- Tier B refuses to start until `GHOSTBENCH_AGENT_CMD` names an
+  agent command, runs that agent only inside a contained copy, and
+  scores the outcome with the task's own tests: a stand-in agent
+  that fixes the task passes, and one that does nothing, crashes,
+  or overruns its timeout fails with the reason recorded.
 - Every `BENCH.md` number traces to a manifest hash + a report row.
 
 ## Out of scope for v0.1
@@ -382,7 +412,8 @@ tools on stated corpora.
 
 ```
 src/ghostbench/     the core (Agent A): corpus loader, Tier A runner,
-                    Tier B runner with the budget gate, compare, reports
+                    Tier B live-agent runner (GHOSTBENCH_AGENT_CMD),
+                    compare, reports
 tests/              format + fixture tests (run without the core) and
                     black-box CLI tests for run / live-refusal / compare
 examples/
