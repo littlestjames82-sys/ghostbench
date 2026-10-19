@@ -4,6 +4,70 @@ Reproducible record of a full-suite run. Regenerate on every
 release-grade change; counts quoted anywhere else must match this
 file or be removed.
 
+## Run of Oct 18, 2026 (budget cap restored)
+
+- Date (UTC): 2026-10-19T03:32Z
+- Platform: Linux 7.0.0-39-generic x86_64
+- Python: 3.12.3
+- pytest: 9.1.1
+- Tree: ghostbench v0.1.0, live-agent build + budget cap gate
+- Command:
+
+```sh
+cd ghostbench
+PYTHONPATH=src python3 -m pytest tests -q
+```
+
+- Result: **109 passed, 0 skipped** (8.04s) - the 102 of the
+  live-agent build below plus 7 new tests in
+  `tests/test_budget_gate.py`.
+
+### What changed: the budget cap is back, as a second gate
+
+Per Ryan's direction, the v0.1 budget cap returns on top of the
+`GHOSTBENCH_AGENT_CMD` configuration gate, in `check_budget`'s
+native semantics: the surviving utility compares a TOKEN count
+against `budget_tokens` - it prices nothing in currency and the
+price table plays no part. `ghostbench live --budget TOKENS` now:
+
+- after the configuration check (unconfigured still refuses
+  first, exactly as before) and before any agent runs, estimates
+  the run's context size as the sum of the per-task full-context
+  token estimates from Bench's estimator - the same numbers a
+  run reports as `full_tokens` (a unit test pins the estimate
+  against both `check_budget` and a real run's totals);
+- refuses when the estimate exceeds the cap and `--confirm` is
+  absent: exit 2, the estimate and the cap printed with the exact
+  `--confirm` invocation, and nothing written (no report, no run
+  folder, no ledger entry - asserted by test);
+- with `--confirm`, proceeds; the report records `budget_cap`,
+  `budget_estimate`, and `budget_confirmed` at report level, and
+  BENCH.md shows the cap line (with a "cap exceeded - run
+  proceeded under --confirm" note when applicable). With no
+  `--budget`, behavior is exactly the live-agent build's, and the
+  report records the cap as unset (null).
+
+The estimate is Bench's own and is labelled as such everywhere it
+appears (help, refusal, BENCH.md): the cap bounds the estimate in
+tokens, NOT the configured agent's real cost, which is whatever
+the agent itself charges inside the user's own program. Bench
+does not meter the agent and the cap does not bound its billing.
+
+### CLI proof (stand-in agent, one-task probe corpus)
+
+- No `--confirm`, `--budget 10` against a 36-token estimate:
+  exit 2, "budget cap exceeded: this live run is estimated at 36
+  context tokens, over the --budget cap of 10 tokens", the exact
+  re-run line `ghostbench live <corpus> --budget 10 --confirm`
+  printed, and the output directory listing confirms nothing was
+  written.
+- Same command with `--confirm`: exit 0, task passes; the CLI
+  prints "budget: cap 10 tokens, estimated run context 36 tokens
+  (cap exceeded, confirmed)"; the report carries
+  `budget_cap: 10, budget_estimate: 36, budget_confirmed: true`,
+  and BENCH.md's budget line ends "Cap exceeded - run proceeded
+  under --confirm".
+
 ## Run of Oct 18, 2026 (live-agent build)
 
 - Date (UTC): 2026-10-19T02:52Z

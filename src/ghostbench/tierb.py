@@ -15,6 +15,19 @@ model is gone; what replaced it:
   live run refuses BEFORE anything runs: no task is attempted and
   no report is written. Bench never runs an agent it was not
   configured to run.
+- On top of that configuration gate, ``ghostbench live --budget
+  TOKENS`` restores the v0.1 budget cap as a second, independent
+  gate (Ryan's direction, Oct 18, 2026): after the agent check and
+  before any agent runs, the run's context size is estimated (the
+  sum of the per-task full-context token estimates, from Bench's
+  own estimator - the same numbers a run later reports as
+  ``full_tokens``) and checked with :func:`check_budget`. Over the
+  cap without ``--confirm``, the run refuses and writes nothing;
+  with ``--confirm`` it proceeds and the report records the cap,
+  the estimate, and that confirmation overrode the cap. The cap is
+  in TOKENS and meters Bench's estimate only: the configured
+  agent's real charges happen inside the user's own program and
+  are never metered by Bench.
 - Per task, the agent runs inside a contained copy of the project,
   reusing the Tier A containment machinery (safe copy with
   escaping symlinks skipped and recorded, scrubbed allowlist
@@ -508,9 +521,89 @@ def run_live_task(corpus: Corpus, project: Project, task: Task, *,
     }
 
 
+def estimate_task_context_tokens(corpus: Corpus, project: Project,
+                                 task: Task) -> int:
+    """The full-context token estimate for one task - the same
+    number :func:`run_live_task` later reports as the row's
+    ``full_tokens``: the project scan total from Bench's estimator,
+    overridden by the task's ``full`` variant spec when one is
+    supplied and yields a token count."""
+    full_tokens = sum(_file_tokens(project, rel)
+                      for rel in list_project_files(project.path))
+    full_spec = (task.variants or {}).get("full")
+    if full_spec:
+        full_v = _variant_from_spec(corpus, full_spec)
+        if full_v["tokens"] is not None:
+            full_tokens = full_v["tokens"]
+    return full_tokens
+
+
+def estimate_live_run_tokens(corpus: Corpus,
+                             task_filter: set | None = None) -> int:
+    """Estimated context tokens for a live run over the selected
+    tasks: the sum of the per-task full-context estimates.
+
+    This is an ESTIMATE, in tokens, from Bench's token estimator -
+    the size of the context the tasks represent, not a measurement
+    of anything the configured agent will consume or be billed.
+    The agent is the user's own program; what it reads, uses, or
+    charges is outside Bench and is not estimated here.
+    """
+    return sum(
+        estimate_task_context_tokens(corpus, project, task)
+        for project, task in corpus.all_tasks()
+        if not task_filter or task.id in task_filter)
+
+
+def budget_gate(corpus: Corpus, *, budget_cap=None, confirmed=False,
+                task_filter: set | None = None) -> dict:
+    """The ``--budget`` gate for a live run, decided by
+    :func:`check_budget` against the run's estimated context
+    tokens.
+
+    With no cap, returns the unset record (``budget_cap`` and
+    ``budget_estimate`` None, ``budget_confirmed`` False) and no
+    estimate is computed - behaviour is exactly the ungated run.
+    With a cap, the estimate is computed; when it exceeds the cap
+    and ``confirmed`` is false, raises :class:`TierBRefusal`
+    before anything runs. When it exceeds the cap and ``confirmed``
+    is true, the returned record carries ``exceeded: True`` so the
+    caller can say the cap was overridden. The returned dict's
+    ``budget_cap`` / ``budget_estimate`` / ``budget_confirmed``
+    fields are what the report records.
+    """
+    if budget_cap is None:
+        return {"budget_cap": None, "budget_estimate": None,
+                "budget_confirmed": False, "exceeded": False}
+    if isinstance(budget_cap, bool) \
+            or not isinstance(budget_cap, (int, float)) \
+            or budget_cap <= 0:
+        raise TierBRefusal(
+            "the budget cap must be a positive number of tokens "
+            f"(got {budget_cap!r}). Nothing was run.")
+    estimate = estimate_live_run_tokens(corpus, task_filter)
+    within = check_budget({"budget_tokens": budget_cap}, estimate)
+    if not within and not confirmed:
+        raise TierBRefusal(
+            f"budget cap exceeded: this live run is estimated at "
+            f"{estimate} context tokens, over the --budget cap of "
+            f"{budget_cap} tokens. The estimate is the sum of the "
+            "per-task full-context token estimates from Bench's "
+            "own estimator - it caps Bench's estimate only. The "
+            "configured agent's real cost is whatever the agent "
+            "itself charges, inside your own program; Bench does "
+            "not meter it and this cap does not bound it. Nothing "
+            "was run and nothing was spent. To run anyway, add "
+            "--confirm to the same command.")
+    return {"budget_cap": budget_cap, "budget_estimate": estimate,
+            "budget_confirmed": bool(confirmed),
+            "exceeded": not within}
+
+
 def run_live_corpus(corpus: Corpus, *, agent_cmd=None, agent_argv=None,
                     agent_timeout: int = DEFAULT_AGENT_TIMEOUT,
-                    task_filter: set | None = None) -> dict:
+                    task_filter: set | None = None,
+                    budget: dict | None = None) -> dict:
     """Run Tier B live over a corpus and return the report dict.
 
     The agent command comes from ``agent_argv`` if given, else from
@@ -520,7 +613,10 @@ def run_live_corpus(corpus: Corpus, *, agent_cmd=None, agent_argv=None,
     :class:`TierBRefusal` before any task runs. The report dict has
     the same shape as a Tier A report (see ``runner.run_corpus``),
     with ``tier`` ``"B"`` and ``verification_level`` ``"live-agent"``
-    on the report and every row.
+    on the report and every row. ``budget`` is the record returned
+    by :func:`budget_gate` (the CLI's ``--budget`` gate runs before
+    this function is called); its cap/estimate/confirmed fields are
+    recorded on the report, all unset when no budget was given.
     """
     if agent_argv is None:
         agent_argv = (parse_agent_command(agent_cmd)
@@ -612,6 +708,10 @@ def run_live_corpus(corpus: Corpus, *, agent_cmd=None, agent_argv=None,
                       "Bench records no agent token usage and "
                       "estimates none."),
         "run_tests": True,
+        "budget_cap": (budget or {}).get("budget_cap"),
+        "budget_estimate": (budget or {}).get("budget_estimate"),
+        "budget_confirmed": bool((budget or {}).get(
+            "budget_confirmed", False)),
         "agent": {
             "name": agent_name_of(agent_argv),
             "command_source": AGENT_CMD_ENV,
@@ -649,11 +749,15 @@ def run_live_corpus(corpus: Corpus, *, agent_cmd=None, agent_argv=None,
 def check_budget(pre: dict, tokens_used: int) -> bool:
     """True while usage is within the cap in ``pre``.
 
-    Retained from the v0.1 gate model as a utility for callers that
-    wrap a live run with their own budget accounting. The live CLI
-    no longer takes a budget: the configured agent is the user's own
-    command and whatever it spends happens outside Bench, so Bench
-    has no spend of its own to cap.
+    The cap is ``pre[\"budget_tokens\"]``, in TOKENS; usage is a
+    token count. This is the v0.1 gate model's surviving utility,
+    and since the budget-cap restoration (Oct 18, 2026) it is the
+    decision function behind the live CLI's ``--budget`` gate:
+    :func:`budget_gate` checks the run's ESTIMATED context tokens
+    against the cap with it. It prices nothing in currency - the
+    price table plays no part here - and it meters nothing the
+    configured agent actually consumes; callers also use it to
+    wrap a live run with their own budget accounting.
     """
     cap = pre.get("budget_tokens")
     if cap is None or isinstance(cap, bool) \

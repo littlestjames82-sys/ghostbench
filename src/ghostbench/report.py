@@ -68,6 +68,22 @@ def render_bench_md(report: dict) -> str:
     level = report.get("verification_level")
     lines.append(f"- Verification level: {_fmt(level)} - "
                  f"{_level_words(level)}")
+    if "budget_cap" in report:
+        cap = report.get("budget_cap")
+        if cap is None:
+            lines.append("- Budget cap: none set (this live run "
+                         "was not budget-gated)")
+        else:
+            line = (f"- Budget cap: {cap} tokens | Estimated run "
+                    f"context: {_fmt(report.get('budget_estimate'))} "
+                    "tokens (Bench's token-estimator estimate of "
+                    "the run's context size; NOT the agent's billed "
+                    "cost, which Bench does not meter)")
+            if report.get("budget_confirmed") \
+                    and (report.get("budget_estimate") or 0) > cap:
+                line += (" | Cap exceeded - run proceeded under "
+                         "--confirm")
+            lines.append(line)
     lines.append(f"- Tool: ghostbench {report['tool_version']}")
     lines.append(f"- Corpus: {report['corpus']['name']} "
                  f"v{report['corpus']['version']}")

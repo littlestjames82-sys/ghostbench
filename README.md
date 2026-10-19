@@ -97,6 +97,19 @@ access is **not blocked**; every live report's `sandbox` block
 states this. Tier B is never run on a schedule or in CI by default;
 CI gets Tier A.
 
+**Budget cap (second gate, opt-in): `live --budget TOKENS`.** After
+the configuration gate and before any agent runs, Bench estimates
+the run's context size - the sum of the per-task full-context token
+estimates from its own estimator, the same numbers the report shows
+as `full_tokens` - and checks it against the cap with
+`tierb.check_budget` (estimated tokens <= cap). Over the cap, the
+run refuses (exit 2, nothing written) unless `--confirm` is given;
+a confirmed run proceeds and its report records `budget_cap`,
+`budget_estimate`, and `budget_confirmed`. The cap is in tokens and
+bounds Bench's estimate only: the configured agent's real cost is
+whatever the agent itself charges, inside your own program - Bench
+does not meter the agent, and the cap does not bound its billing.
+
 ## Quickstart
 
 All of the commands below are Tier A or read-only unless marked
@@ -275,9 +288,11 @@ command source), and per-row live fields: `agent_name`,
 `files_deleted` / `files_modified`, a `sandbox` block stating the
 live containment honestly, and the contained `test` outcome against
 the agent's edits. `verification_level` is `live-agent` on the
-report and every row. Bench records no agent token usage in Tier B:
-the configured agent reports none to Bench, and none is estimated
-or blended in.
+report and every row. Tier B reports also record the budget gate at
+report level: `budget_cap` and `budget_estimate` (both null when no
+`--budget` was given) and `budget_confirmed`. Bench records no agent
+token usage in Tier B: the configured agent reports none to Bench,
+and none is estimated or blended in.
 
 The sliced arm, when a task supplies no bundle, is derived from the
 task's `expected_files` and labelled in the row as
@@ -294,7 +309,7 @@ and they must never be quoted as bench results.
 | Command | What it does |
 |---|---|
 | `ghostbench run <corpus.json> [--suite slice\|verify\|recall\|proxy] [--out <dir>] [--task <id> ...] [--run-tests] [--model <id>] [--ledger <path>] [--no-ledger] [--strict]` | Tier A run. `--run-tests` is opt-in and runs task test commands in a temp copy only. `--strict` exits 1 when any task fails |
-| `ghostbench live <corpus.json> [--out <dir>] [--task <id> ...] [--agent-timeout <seconds>] [--ledger <path>] [--no-ledger] [--strict]` | Tier B live run. The agent command comes only from `GHOSTBENCH_AGENT_CMD`; without one configured, live refuses before anything runs. Per task the agent attempts the task in a contained copy (receiving `GHOSTBENCH_TASK_DIR` / `GHOSTBENCH_TASK_ID` / `GHOSTBENCH_TASK_PROMPT` and the copy path as final argument), Bench measures the changed files, and the task's tests run in the same copy. `--agent-timeout` defaults to 300s; `--strict` exits 1 when any task fails |
+| `ghostbench live <corpus.json> [--out <dir>] [--task <id> ...] [--agent-timeout <seconds>] [--budget <tokens>] [--confirm] [--ledger <path>] [--no-ledger] [--strict]` | Tier B live run. The agent command comes only from `GHOSTBENCH_AGENT_CMD`; without one configured, live refuses before anything runs. Per task the agent attempts the task in a contained copy (receiving `GHOSTBENCH_TASK_DIR` / `GHOSTBENCH_TASK_ID` / `GHOSTBENCH_TASK_PROMPT` and the copy path as final argument), Bench measures the changed files, and the task's tests run in the same copy. `--agent-timeout` defaults to 300s; `--budget` caps the run's estimated context tokens (refuses over the cap unless `--confirm`); `--strict` exits 1 when any task fails |
 | `ghostbench compare <run-a.json> <run-b.json> [--out <file>]` | Per-task token and status deltas (B - A). `.json` out writes the compare object, anything else writes Markdown. Warns when estimator versions differ |
 | `ghostbench add <corpus.json> --project <path> --id <id> [--name <name>]` | Record a project in a corpus file by tree hash |
 | `ghostbench demo-corpus <dir>` | Write the core's starter adversarial corpus into a directory you choose |
@@ -326,7 +341,7 @@ and they must never be quoted as bench results.
 |---|---|
 | 0 | Success. For `run`, also: no `--strict` failure. |
 | 1 | `run --strict` / `live --strict` only: at least one task failed. The report is still written. |
-| 2 | Usage error, corpus error (missing file, invalid JSON, duplicate id, missing project path, non-positive budget), or a Tier B refusal. For Tier B, the refusal message states that no agent is configured and that nothing was run. |
+| 2 | Usage error, corpus error (missing file, invalid JSON, duplicate id, missing project path, non-positive budget), or a Tier B refusal. For Tier B, the refusal message states the reason - no agent configured, or the estimated run context over the `--budget` cap without `--confirm` - and that nothing was run. |
 
 Running with no subcommand prints the help text and exits 2.
 
@@ -349,10 +364,13 @@ Running with no subcommand prints the help text and exits 2.
   re-run with `--run-tests` and a task `test_command`.
 - **The adversarial run shows failures** - that is the designed
   outcome, not a broken install. See Quickstart step 1.
-- **`Tier B refused: ...`** - no agent is configured, or the
-  configured command could not be parsed. Read the message: it
-  names `GHOSTBENCH_AGENT_CMD` and shows how to set it. Nothing ran
-  and nothing was written.
+- **`Tier B refused: ...`** - no agent is configured, the
+  configured command could not be parsed, or the run's estimated
+  context is over your `--budget` cap. Read the message: for an
+  agent problem it names `GHOSTBENCH_AGENT_CMD` and shows how to
+  set it; for a budget problem it prints the estimate, the cap,
+  and the exact `--confirm` invocation. Nothing ran and nothing
+  was written either way.
 - **Compare warns that estimator versions differ** - the two runs
   were measured with different estimators, so their totals are not
   directly comparable. Re-run one side so both reports carry the

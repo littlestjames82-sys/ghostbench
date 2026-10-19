@@ -14,14 +14,17 @@ Commands:
   ghostbench add <corpus> --project PATH --id ID [--name NAME]
       Record a project in a corpus file by tree hash. Copies no code.
   ghostbench live <corpus> [--out DIR] [--task ID ...]
-                          [--agent-timeout SECONDS] [--ledger PATH]
+                          [--agent-timeout SECONDS] [--budget TOKENS]
+                          [--confirm] [--ledger PATH]
                           [--no-ledger] [--strict]
       Tier B live run: for each task, the agent command configured
       in the GHOSTBENCH_AGENT_CMD environment variable attempts the
       task in a contained copy, then the task's tests run in the
       same copy. Reports carry verification_level "live-agent".
       With no agent configured, live refuses before anything runs.
-      See ghostbench.tierb.
+      With --budget, the run's estimated context tokens are checked
+      against the cap before anything runs; over the cap it refuses
+      unless --confirm is given. See ghostbench.tierb.
   ghostbench demo-corpus <dir>
       Write the starter adversarial demo corpus into <dir>.
   ghostbench version
@@ -45,7 +48,7 @@ from .report import (compare_reports, render_compare_md,
                      write_bench_md, write_json_report)
 from .runner import append_ledger, run_corpus
 from .tierb import (AGENT_CMD_ENV, TierBRefusal, agent_argv_from_env,
-                    run_live_corpus)
+                    budget_gate, run_live_corpus)
 
 
 def _cmd_run(args) -> int:
@@ -172,10 +175,33 @@ def _cmd_live(args) -> int:
         return 2
     corpus = load_corpus(args.corpus)
     task_filter = set(args.task) if args.task else None
+    # The budget gate runs after the configuration gate and before
+    # any agent runs, with the same refusal discipline: exit 2 and
+    # nothing written.
+    try:
+        budget = budget_gate(corpus, budget_cap=args.budget,
+                             confirmed=args.confirm,
+                             task_filter=task_filter)
+    except TierBRefusal as exc:
+        print(f"Tier B refused: {exc}", file=sys.stderr)
+        invocation = ["ghostbench", "live", str(args.corpus)]
+        for task_id in args.task or []:
+            invocation += ["--task", str(task_id)]
+        invocation += ["--budget", str(args.budget), "--confirm"]
+        print("  to run anyway: " + " ".join(invocation),
+              file=sys.stderr)
+        return 2
+    if budget["exceeded"]:
+        print(f"budget: estimated {budget['budget_estimate']} "
+              f"context tokens exceeds the cap of "
+              f"{budget['budget_cap']} tokens; proceeding under "
+              "--confirm (the cap bounds Bench's estimate only, "
+              "not the agent's own charges)")
     try:
         report = run_live_corpus(corpus, agent_argv=agent_argv,
                                  agent_timeout=args.agent_timeout,
-                                 task_filter=task_filter)
+                                 task_filter=task_filter,
+                                 budget=budget)
     except TierBRefusal as exc:
         print(f"Tier B refused: {exc}", file=sys.stderr)
         return 2
@@ -200,6 +226,12 @@ def _cmd_live(args) -> int:
     print(f"run {report['run_id']}: tasks={t['tasks']} "
           f"pass={t['pass']} fail={t['fail']} unknown={t['unknown']} "
           f"verification_level={report['verification_level']}")
+    if budget["budget_cap"] is not None:
+        print(f"budget: cap {budget['budget_cap']} tokens, "
+              f"estimated run context "
+              f"{budget['budget_estimate']} tokens"
+              + (" (cap exceeded, confirmed)"
+                 if budget["exceeded"] else ""))
     print(f"wrote {out_dir}/BENCH.md and bench-report.json")
     if ledger_path:
         print(f"ledger appended: {ledger_path}")
@@ -329,10 +361,30 @@ def build_parser() -> argparse.ArgumentParser:
                     "NOT prevented, and network access is NOT "
                     "blocked. POSIX rlimits and the timeout are "
                     "best-effort. Every report's sandbox block states "
-                    "exactly this.",
+                    "exactly this.\n\n"
+                    "Budget cap: --budget TOKENS adds a second, "
+                    "independent gate. After the agent check and "
+                    "before any agent runs, Bench estimates the "
+                    "run's context size - the sum of the per-task "
+                    "full-context token estimates from Bench's own "
+                    "estimator, the same numbers the report later "
+                    "shows as full_tokens - and checks it against "
+                    "the cap (the check_budget rule: estimated "
+                    "tokens <= cap). Over the cap, live refuses "
+                    "before anything runs and writes nothing, "
+                    "unless --confirm is given; a confirmed run "
+                    "records the cap, the estimate, and the "
+                    "confirmation in its report. The cap is in "
+                    "TOKENS and bounds Bench's estimate only: the "
+                    "configured agent's real cost is whatever the "
+                    "agent itself charges, inside your own program. "
+                    "Bench does not meter the agent, and no cap "
+                    "here bounds what it bills.",
         epilog="Example:\n"
                "  GHOSTBENCH_AGENT_CMD='my-agent --non-interactive' "
-               "ghostbench live corpus.json --out /tmp/live-1")
+               "ghostbench live corpus.json --out /tmp/live-1\n"
+               "  GHOSTBENCH_AGENT_CMD='my-agent --non-interactive' "
+               "ghostbench live corpus.json --budget 200000 --confirm")
     p_live.add_argument("corpus", help="path to the corpus JSON file")
     p_live.add_argument("--out", metavar="DIR",
                         help="output folder for BENCH.md and "
@@ -344,6 +396,19 @@ def build_parser() -> argparse.ArgumentParser:
                         default=300,
                         help="wall-clock timeout for each task's agent "
                              "attempt (default: 300)")
+    p_live.add_argument("--budget", type=int, metavar="TOKENS",
+                        help="cap the run's estimated context tokens "
+                             "(sum of the per-task full-context "
+                             "estimates from Bench's estimator). Over "
+                             "the cap, live refuses before anything "
+                             "runs unless --confirm is given. The cap "
+                             "bounds Bench's estimate only, never "
+                             "the agent's own charges")
+    p_live.add_argument("--confirm", action="store_true",
+                        help="proceed even when the estimated run "
+                             "context exceeds --budget; the report "
+                             "records the cap, the estimate, and "
+                             "that confirmation overrode the cap")
     p_live.add_argument("--ledger", metavar="PATH",
                         help="history ledger file to append to (default: "
                              ".ghostbench-history.jsonl next to the corpus)")
